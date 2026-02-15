@@ -1,0 +1,106 @@
+wandb:
+  entity: "ruikangzhao-danmarks-tekniske-universitet-dtu"
+  resume: "allow"
+  run_id: "cntrqb004"
+  project: "df_sdar"
+  run_name: "${training.method}_${model.model_base}_${rollout.max_token}_kl_${training.beta}_beta_n${rollout.num_response_per_task}"
+
+experiment:
+  project: "rl_sdar" # need to be same of this file name
+  function: "train" # no need to change
+  start_from_scratch: False # set to True by default, if you stopped the training, and want to keep training with your ckpt model.optimized_name, set to False, and set current_epoch to the last step you stopped
+  total_step: 160
+  save_every: 20
+  eval_every: 5
+  current_epoch: 1
+  deepspeed_file: "1_node_8_gpus_deepspeed_zero3"
+  num_node: 1
+  node_index: 0
+
+model:
+  pretrained_model: "/workspace/home/ligong/collab/ruikang/dllm/rl_sdar/ckpt/optimized" # absolute path of your model /workspace/home/ligong/collab/ruikang/dllm/SDAR-1.7B-Chat
+  optimized_name: "optimized" # the output name for your optimized model, will be saved under sft_dream/ckpt
+  model_base: "sdar" # set sdar for TraDo and SDAR
+
+dataset:
+  train_dataset: "MATH_train" # "MATH_train""PrimeIntellect"
+  optimization_data: "rl_data" # name of the rollout data output
+  data_type: "math" # "math" "code"
+
+# also see explanations in eval configs
+rollout:
+  tensor_parallel_size: 1 # set to 1 by default, if oom, try reduce max_active first, if still oom, set tensor_parallel_size to 8
+  max_active: 256
+  num_task_per_step: 128 # number of prompts in one step
+  num_response_per_task: 16 #rollout n
+  temperature: 1.0
+  max_token: 256
+  block_size: 4
+  denoising_steps_per_block: 4
+  top_p: 1.0
+  top_k: 0
+  remasking_strategy: "low_confidence_dynamic" #"low_confidence_static""low_confidence_dynamic"
+  dynamic_threshold: 0.9 # no use for "low_confidence_static"
+  start_with_think: False
+
+execute:
+  num_chunk: 128 # batch size of executing codes in coding eval tasks
+
+training:
+  normalize_method: "z_score" # "z_score" "dr_grpo"
+  gradient_checkpointing_enable: True
+  gradient_accumulation_steps: 8
+  batch_size_lm: 1
+  mixed_precision: "bf16"
+  enable_tf32: True
+  seed: 10086
+  num_train_epochs: 1
+  max_grad_norm: 1.0
+  method: "TraceRL" # "random_masking" "TraceRL" "coupled"
+  block_size: 4
+  shrink: 1
+  post_num: 0
+  max_gen_length: 256
+  max_prompt_len: 784
+  lower_p: 0.1
+  upper_p: 0.9
+  eps: 0.20
+  beta: 0.01
+  use_kl_estimator_k3: True
+  # clip_ratio_low: 0.0003
+  # clip_ratio_high: 0.0004
+  # importance_sampling_level: "block" # "sequence" "sequence_token" "block"
+
+optimizer:
+  name: adamw
+  params: # default adamw params
+    learning_rate: 1e-6
+    scale_lr: False # scale learning rate by total batch size
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0
+    epsilon: 1e-8
+
+lr_scheduler:
+  scheduler: "cosine"
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 0
+    min_lr_scale: 1.0
+
+evaluation:
+  eval_dataset: "MATH500" # "MATH500" "LiveCodeBench"
+  data_type: "math" # "math" "code"
+  tensor_parallel_size: 1
+  max_active: 256
+  num_response_per_task: 3
+  temperature: 1.0
+  max_token: 256
+  block_size: 4
+  denoising_steps_per_block: 4
+  top_p: 1.0
+  top_k: [0, 1]
+  remasking_strategy: ["low_confidence_dynamic", "low_confidence_static"] #"low_confidence_static""low_confidence_dynamic"
+  dynamic_threshold: 0.9 # no use for "low_confidence_static"
+  start_with_think: False
+# len(top_k) must == len(remasking_strategy)

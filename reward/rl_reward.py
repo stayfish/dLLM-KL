@@ -7,6 +7,8 @@ import asyncio
 from termcolor import cprint
 from omegaconf import MISSING
 from omegaconf import DictConfig, ListConfig, OmegaConf
+import wandb
+
 def get_config():
     cli_conf = OmegaConf.from_cli()
     yaml_conf = OmegaConf.load(cli_conf.config)
@@ -16,6 +18,16 @@ def get_config():
 if __name__ == "__main__":
 
     config = get_config()
+
+    # Initialize wandb
+    wandb.init(
+        project=config.wandb.project,
+        entity=config.wandb.get("entity"),
+        id=config.wandb.run_id,
+        resume=config.wandb.resume,
+        name=config.wandb.run_name,
+        reinit=True,
+    )
 
     project_name = config.experiment.project
     
@@ -78,6 +90,10 @@ if __name__ == "__main__":
             return [0 for x in lst]
         return [(x - mean) / std for x in lst]
 
+    def dr_grpo_normalize(lst):
+        mean = sum(lst) / len(lst)
+        return [x - mean for x in lst]
+
 
 
 
@@ -92,6 +108,9 @@ if __name__ == "__main__":
 
 
     final_data = []
+    # Track how many groups are filtered out 
+    dropped_groups = 0
+    kept_groups = 0
     for i in range(len(data)):
         correctness = data[i]["correctness"]
         lengths = data[i]["response_length"]
@@ -102,16 +121,25 @@ if __name__ == "__main__":
             if OmegaConf.select(config, "rollout.max_token", default=MISSING) is not MISSING and lengths[j] >= config.rollout.max_token - 5:
                 correctness[j] = False
         
-        rewards = z_score_normalize(correctness)
+        
+        normalize_method = OmegaConf.select(config, "training.normalize_method", default="z_score")
+        if normalize_method == "z_score":
+            rewards = z_score_normalize(correctness)
+        elif normalize_method == "dr_grpo":
+            rewards = dr_grpo_normalize(correctness)
+        else:
+            raise ValueError(f"Unknown normalize method: {normalize_method}")
         #rewards = [int(b) for b in correctness]
 
-        data[i]["rewards"] = rewards
+        data[i]["rewards"] = rewards # (n,)
         
         if config.experiment.function == "train":
 
             proportion = sum(correctness) / len(correctness)
             if proportion > 0.8 or proportion < 0.2:
+                dropped_groups += 1
                 continue
+            kept_groups += 1
 
             for j in range(len(rewards)):
                 #if rewards[j] == 0:
@@ -121,6 +149,7 @@ if __name__ == "__main__":
                 data_i["reward"] = rewards[j]
                 data_i["response"] = data[i]["full_output"][j]
                 data_i["step_map"] = data[i]["step_map"][j]
+                data_i["group_id"] = i
                 final_data.append(data_i)
         
         if config.experiment.function == "evaluation":
@@ -149,17 +178,54 @@ if __name__ == "__main__":
         
         acc = sum(correctness_list)/len(correctness_list)
         avg_len = sum(response_length_list)/len(response_length_list)
+        total_groups = len(data)
+        dropped_rate = dropped_groups / total_groups 
 
         output_text = f"train step: {config.experiment.current_epoch}  "
         
         if config.experiment.function == "train":
+            strategy = config.rollout.remasking_strategy
+            reward_mean = acc
+
             if config.model.model_base != "sdar" and config.model.model_base != "trado":
                 output_text = output_text + f"remasking_strategy: {config.rollout.remasking_strategy}  block_size: {config.rollout.block_size}  acc: {acc}  avg length: {avg_len}"
             else:
                 output_text = output_text + f"remasking_strategy: {config.rollout.remasking_strategy}  top_k: {config.rollout.top_k}  acc: {acc}  avg length: {avg_len}"
         else:
+            strategy = config.evaluation.remasking_strategy
+            reward_mean = acc
             if config.model.model_base != "sdar" and config.model.model_base != "trado":
                 output_text = output_text + f"remasking_strategy: {config.evaluation.remasking_strategy}  block_size: {config.evaluation.block_size}  acc: {acc}  avg length: {avg_len}"
             else:
                 output_text = output_text + f"remasking_strategy: {config.evaluation.remasking_strategy}  top_k: {config.evaluation.top_k}  acc: {acc}  avg length: {avg_len}"
         save_and_print(output_text)
+
+        metrics_data = {
+            "acc": acc,
+            "avg_len": avg_len,
+            "reward_mean": reward_mean,
+            "epoch": config.experiment.current_epoch,
+            "mode": config.experiment.function,
+            "prompts_total": total_groups,
+            "prompts_kept": kept_groups,
+            "prompts_dropped": dropped_groups,
+            "prompts_drop_rate": dropped_rate,
+        }
+
+        metrics_file_path = f"../{project_name}/temp_data/temp_metrics.json"
+        
+        with open(metrics_file_path, "w", encoding="utf-8") as fm:
+            json.dump(metrics_data, fm, indent=2)
+
+        # Log to wandb
+        if config.experiment.function == "evaluation":
+            prefix = "eval"
+            remask = config.evaluation.remasking_strategy
+            metric_prefix = f"{prefix}/{remask}/block_{config.evaluation.block_size}"
+
+            wandb_log_dict = {
+                f"{metric_prefix}/acc": acc,
+                f"{metric_prefix}/avg_length": avg_len,
+            }
+            
+            wandb.log(wandb_log_dict, step=config.experiment.current_epoch)

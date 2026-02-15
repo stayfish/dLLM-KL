@@ -9,6 +9,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Union
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image
@@ -98,7 +99,7 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
-        log_with=None,
+        log_with="wandb",
         project_dir=config.experiment.logging_dir,
         split_batches=True,
     )
@@ -125,8 +126,14 @@ def main():
             run_id = wandb.util.generate_id()
             config.wandb.run_id = run_id
 
+        wandb_project = config.wandb.get("project", config.experiment.project)
+        wandb_run_name = config.wandb.get("run_name", config.experiment.project)
+
+        wandb_project = config.wandb.get("project", config.experiment.project)
+        wandb_run_name = config.wandb.get("run_name", config.experiment.project)
+
         wandb_init_kwargs = dict(
-            name=config.experiment.project,
+            name=wandb_run_name,
             id=run_id,
             resume=resume_wandb_run,
             entity=config.wandb.get("entity", None),
@@ -136,7 +143,7 @@ def main():
         wandb_config.pop("experiment.resume_from_checkpoint", None)
 
         accelerator.init_trackers(
-            config.experiment.project,
+            wandb_project,
             config=wandb_config,
             init_kwargs={"wandb": wandb_init_kwargs},
         )
@@ -702,6 +709,15 @@ def main():
     first_epoch = 0
     data_time_m = AverageMeter()
     end = time.time()
+    global_step = 0
+    metric_totals = defaultdict(float)
+    metric_counts = defaultdict(float)
+    
+    # Epoch-level aggregators
+    epoch_metric_totals = defaultdict(float)
+    epoch_metric_counts = defaultdict(float)
+
+    METRICS_NO_AVG = {"clip_count", "clip_total"}
 
     
 
@@ -710,7 +726,9 @@ def main():
 
     def forward_process(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
 
-        adv = torch.as_tensor(adv, device=extended_input_ids.device).detach()
+        adv = torch.as_tensor(
+            adv, device=extended_input_ids.device, dtype=torch.float32
+        ).detach()
 
         B, L = p_mask.shape
         L0    = start_pos
@@ -745,6 +763,7 @@ def main():
 
         # KL penalty (optional)
         kl_loss = torch.tensor(0.0, device=policy_loss.device)
+        kl_mean = torch.zeros((), device=policy_loss.device)
         if config.training.beta > 0:
             kl_seq = logp_new_tok - logp_old_tok
             kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
@@ -752,13 +771,58 @@ def main():
                 t = (-kl_seq).clamp(-10.0, 10.0)
                 kl_seq = t.exp() - 1.0 + kl_seq
             kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
+            kl_mean = kl_seq.mean()
             kl_loss = config.training.beta * kl_seq.sum() / B
             total_loss = policy_loss + kl_loss
         else:
             total_loss = policy_loss
+        
+        clip_mask = ((ratio - clipped).abs() > 1e-8) & p_mask
+        clip_count = clip_mask.float().sum()
+        clip_total = p_mask.float().sum()
 
-        return total_loss
+        reward_mean = adv.mean()
+        reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
+        entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+        entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
 
+        metrics = {
+            "loss/total": total_loss.detach(),
+            "loss/policy": policy_loss.detach(),
+            "loss/kl": kl_loss.detach(),
+            "kl/mean": kl_mean.detach(),
+            "policy/entropy": entropy_mean.detach(),
+            "advantage/mean": reward_mean.detach(),
+            "clip_count": clip_count.detach(),
+            "clip_total": clip_total.detach(),
+        }
+
+        return total_loss, metrics
+
+
+    def calculate_metrics(totals, counts):
+        result = {}
+        for name, total in totals.items():
+            if name in METRICS_NO_AVG:
+                continue
+            count = counts.get(name, 0.0)
+            if count > 0:
+                result[name] = total / count
+        
+        clip_total_total = totals.get("clip_total", 0.0)
+        if clip_total_total > 0:
+            clip_ratio = totals.get("clip_count", 0.0) / clip_total_total
+            result["clip_ratio"] = clip_ratio
+        return result
+
+    def log_to_console(log_dict, step_label, step_val):
+        if accelerator.is_main_process:
+            print(f"[DEBUG] logging at {step_label}={step_val}, keys={list(log_dict.keys())}")
+            for k, v in log_dict.items():
+                try:
+                    print(f"    {k} = {float(v):.6f}")
+                except:
+                    pass
 
 
 
@@ -768,7 +832,17 @@ def main():
 
     for epoch in range(first_epoch, num_train_epochs):
         
+        epoch_metric_totals.clear()
+        epoch_metric_counts.clear()
+
         model.train()
+
+        if accelerator.is_local_main_process:
+            print("\n" + "=" * 120)
+            print(f"[DEBUG] >>> ENTER EPOCH {epoch+1}/{num_train_epochs}")
+            print(f"[DEBUG] dataset size = {len(dataset_lm)}, "
+                  f"num_update_steps_per_epoch = {num_update_steps_per_epoch}")
+            print("=" * 120 + "\n")
         
         progress_bar = tqdm(
             train_dataloader_lm,
@@ -796,7 +870,7 @@ def main():
             if torch.isneginf(old_lp).any().item():
                 print(old_lp)
 
-            loss_lm = forward_process(
+            loss_lm, step_metrics = forward_process(
                     extended_input_ids=extended_input_ids,
                     p_mask=p_mask,
                     tok_idx_ext=tok_idx_ext,
@@ -805,6 +879,18 @@ def main():
                     logp_old_tok=old_lp
                 )
             loss_lm = loss_lm / accelerator.gradient_accumulation_steps
+
+            if accelerator.is_local_main_process and step <= 5:
+                print(f"[DEBUG] step={step} (local) raw loss/total={step_metrics['loss/total'].item():.6f}, "
+                      f"loss/policy={step_metrics['loss/policy'].item():.6f}, "
+                      f"advantage/mean={step_metrics['advantage/mean'].item():.6f}")
+
+
+            for name, value in step_metrics.items():
+                gathered = accelerator.gather_for_metrics(value.detach())
+                metric_totals[name] += gathered.sum().item()
+                if name not in METRICS_NO_AVG:
+                    metric_counts[name] += float(gathered.numel())
 
 
             if step < 10:
@@ -815,15 +901,76 @@ def main():
                 if config.training.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
 
+                for name, total_val in metric_totals.items(): 
+                    epoch_metric_totals[name] += total_val 
+         
+                for name, count_val in metric_counts.items(): 
+                    epoch_metric_counts[name] += count_val 
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 torch.cuda.empty_cache()
-            
+                
+                global_step += 1
 
+                log_dict = calculate_metrics(metric_totals, metric_counts)
+
+                if lr_scheduler is not None:
+                    log_dict["lr"] = lr_scheduler.get_last_lr()[0]
+
+                if log_dict:
+                    log_to_console(log_dict, "global_step", global_step)
+                    # accelerator.log(log_dict, step=global_step)
+                    if accelerator.is_main_process and "loss/total" in log_dict:
+                        progress_bar.set_postfix({"loss": f"{log_dict['loss/total']:.4f}"})
+
+                metric_totals.clear()
+                metric_counts.clear()
                 
 
+        accelerator.wait_for_everyone()
+
+        epoch_log_dict = calculate_metrics(epoch_metric_totals, epoch_metric_counts)
+        
+
+
+        # Log metrics 
+        metrics_file_path = f"./{project_name}/temp_data/temp_metrics.json"
+        external_metrics = {}
+
+        if os.path.exists(metrics_file_path):
+            with open(metrics_file_path, 'r') as f:
+                metrics_loaded = json.load(f)
+            if metrics_loaded.get("epoch") == config.experiment.current_epoch:
+                
+                prefix = "train" if metrics_loaded.get("mode") == "train" else "eval"
+                
+                external_metrics = {
+                    f"{prefix}/acc": metrics_loaded["acc"],
+                    f"{prefix}/avg_length": metrics_loaded["avg_len"],
+                    f"{prefix}/reward_mean": metrics_loaded.get("reward_mean", 0.0),
+                    "advantage/prompts_total": metrics_loaded["prompts_total"],
+                    "advantage/prompts_kept": metrics_loaded["prompts_kept"],
+                    "advantage/prompts_dropped": metrics_loaded["prompts_dropped"],
+                    "advantage/prompts_drop_rate": metrics_loaded["prompts_drop_rate"],
+                }
+                if accelerator.is_main_process:
+                    logger.info(f"Loaded metrics from {metrics_file_path}: {external_metrics}")
+
+
+        
+      # Merge external metrics
+        if external_metrics:
+            epoch_log_dict.update(external_metrics)
+
+        if accelerator.is_main_process:
+            print("[DEBUG] epoch_log_dict:", {k: float(v) if isinstance(v, (int, float)) else v for k, v in epoch_log_dict.items()})
+        if epoch_log_dict:
+            epoch_step = config.experiment.current_epoch
+            log_to_console(epoch_log_dict, "epoch", epoch_step)
+            accelerator.log(epoch_log_dict, step=epoch_step)
 
     accelerator.wait_for_everyone()
 
