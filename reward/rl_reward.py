@@ -23,7 +23,7 @@ if __name__ == "__main__":
     wandb.init(
         project=config.wandb.project,
         entity=config.wandb.get("entity"),
-        id=config.wandb.run_id,
+        id=config.wandb.get("run_id"),
         resume=config.wandb.resume,
         name=config.wandb.run_name,
         reinit=True,

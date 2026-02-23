@@ -84,6 +84,7 @@ def main():
     config = get_config()
 
     project_name = config.experiment.project
+    run_id = config.wandb.get("run_id", "default")
     if config.experiment.current_epoch == 1:
         pretrained_model = config.model.pretrained_model
     else:
@@ -724,6 +725,22 @@ def main():
 
     
 
+    def kl_estimator(delta, p_mask, estimator):
+        """Per-token KL divergence.  delta = logp_new - logp_old."""
+        delta = torch.where(p_mask, delta, torch.zeros_like(delta))
+        if estimator == "k1":
+            t = delta.clamp(-10.0, 10.0)
+            return t
+        elif estimator == "k2":
+            return 0.5 * delta.pow(2)
+        elif estimator == "k3":
+            t = (-delta).clamp(-10.0, 10.0)
+            return t.exp() - 1.0 + delta
+        else:
+            raise ValueError(f"Unknown KL estimator: {estimator}")
+
+    kl_mode = config.training.get("kl_mode", "in_loss")
+
     def forward_process(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
 
         adv = torch.as_tensor(
@@ -746,37 +763,41 @@ def main():
         
         logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
 
-        ratio   = logp_new_tok - logp_old_tok
-        ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        log_ratio   = logp_new_tok - logp_old_tok
+        ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio)).clamp(-10.0, 10.0)
         ratio   = torch.exp(ratio)          # (B, T)
         clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
 
-        adv_tok = adv.unsqueeze(1)
+         # --- KL computation ---
+        beta = config.training.beta
+        kl_per_seq = torch.zeros(B, device=device)
+        kl_mean = torch.zeros((), device=device)
+        kl_loss = torch.tensor(0.0, device=device)
+        if beta > 0:
+            kl_tok = kl_estimator(log_ratio, p_mask, config.training.kl_estimator)
+            kl_per_seq = (kl_tok * p_mask).sum(dim=1)   # (B,)
+            kl_mean = (kl_per_seq / L1).mean()
+            # kl_per_seq = (kl_tok * p_mask).sum(dim=1) / L1   # (B,)
+            # kl_mean = kl_per_seq.mean()
+
+        # --- PPO surrogate ---
+        if kl_mode == "in_reward":
+            adv_effective = adv - beta * kl_per_seq.detach()
+        else:
+            adv_effective = adv
+            kl_loss = beta * (kl_per_seq / L1).sum() / B
+        adv_tok = adv_effective.unsqueeze(1)
 
         surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
         surrogate_tok = surrogate_tok * p_mask
-
-        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
         surrogate_tok = surrogate_tok.sum(dim=1) / L1
 
         policy_loss = - (surrogate_tok.sum() / B)
 
-        # KL penalty (optional)
-        kl_loss = torch.tensor(0.0, device=policy_loss.device)
-        kl_mean = torch.zeros((), device=policy_loss.device)
-        if config.training.beta > 0:
-            kl_seq = logp_new_tok - logp_old_tok
-            kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
-            if config.training.use_kl_estimator_k3:
-                t = (-kl_seq).clamp(-10.0, 10.0)
-                kl_seq = t.exp() - 1.0 + kl_seq
-            kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
-            kl_mean = kl_seq.mean()
-            kl_loss = config.training.beta * kl_seq.sum() / B
-            total_loss = policy_loss + kl_loss
-        else:
-            total_loss = policy_loss
-        
+        # --- total loss ---
+        total_loss = policy_loss + kl_loss
+
+        # --- metrics ---
         clip_mask = ((ratio - clipped).abs() > 1e-8) & p_mask
         clip_count = clip_mask.float().sum()
         clip_total = p_mask.float().sum()
@@ -789,10 +810,12 @@ def main():
         metrics = {
             "loss/total": total_loss.detach(),
             "loss/policy": policy_loss.detach(),
-            "loss/kl": kl_loss.detach(),
-            "kl/mean": kl_mean.detach(),
+            "loss/kl": kl_loss.detach() if kl_mode == "in_loss" else (beta * kl_per_seq.mean()).detach(),
+            "kl/mean": kl_mean,
             "policy/entropy": entropy_mean.detach(),
             "advantage/mean": reward_mean.detach(),
+            "advantage/std": reward_std.detach(),
+            "advantage/effective_mean": adv_effective.mean().detach(),
             "clip_count": clip_count.detach(),
             "clip_total": clip_total.detach(),
         }

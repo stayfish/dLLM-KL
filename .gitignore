@@ -1,0 +1,32 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.PytestCache/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# 本地符号链接（机器相关路径）
+k1_in_reward
+k3_in_loss
+kl
+
+# 运行输出与临时数据
+temp_data/
+*/temp_data/
+rl_sdar_k3/
+rl_sdar_kl/
+
+# 大体积数据（若需版本管理可注释或删除此行）
+data/*.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.log

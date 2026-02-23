@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import subprocess
 from termcolor import cprint
 
@@ -16,6 +17,7 @@ if __name__ == "__main__":
     start_from_scratch = config.experiment.start_from_scratch
     project_name = config.experiment.project
     model_base = config.model.model_base
+    max_reward_retries = int(config.experiment.get("max_reward_retries", 5))
 
     from omegaconf import MISSING
     if OmegaConf.select(config, "model.value_base_model", default=MISSING) is not MISSING:
@@ -138,7 +140,7 @@ if __name__ == "__main__":
             f'--num_machines 1 '
             f'--machine_rank 0 '
             f'--main_process_ip 127.0.0.1 '
-            f'--main_process_port 8888 '
+            f'--main_process_port 8899 '
             f'--config_file accelerate_configs/{config.experiment.deepspeed_file}.yaml '
             f'train/{script_name} '
             f'config=configs/{project_name}.yaml '
@@ -160,16 +162,29 @@ if __name__ == "__main__":
     i = config.experiment.current_epoch
 
     while i <= config.experiment.total_step:
-        
-        
-        sample(i, "train")
-        if is_code_task:
-            execute(i, "train")
-        
-        if is_process_reward:
-            process_reward(i)
+        # Sample + reward: retry if no prompts kept (all groups filtered by 0.2~0.8)
+        for attempt in range(max_reward_retries):
+            sample(i, "train")
+            if is_code_task:
+                execute(i, "train")
+            if is_process_reward:
+                process_reward(i)
+            else:
+                reward(i, "train", is_code_task)
+            metrics_path = f"{project_name}/temp_data/temp_metrics.json"
+            if os.path.exists(metrics_path):
+                with open(metrics_path, "r") as f:
+                    metrics = json.load(f)
+                if metrics.get("mode") == "train" and metrics.get("prompts_kept", 0) > 0:
+                    break
+                cprint(f"[epoch {i}] attempt {attempt + 1}/{max_reward_retries}: prompts_kept=0, resampling...", "yellow")
+            else:
+                cprint(f"[epoch {i}] attempt {attempt + 1}/{max_reward_retries}: no metrics file, resampling...", "yellow")
         else:
-            reward(i, "train", is_code_task)
+            raise RuntimeError(
+                f"[epoch {i}] All {max_reward_retries} attempts had no prompts in 0.2~0.8. "
+                "Consider relaxing reward filter or increasing num_response_per_task."
+            )
 
         if have_value_model:
             train(i, target = "value")

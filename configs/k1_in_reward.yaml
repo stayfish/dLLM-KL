@@ -2,19 +2,21 @@ wandb:
   entity: 'ruoyufang-uc-santa-barbara'
   resume: 'auto'
 #   run_name: "rl_sdar_k3"
-  run_name: "k3"
+  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_22_4_40"
+  run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}"
+  project: "kl"
 
 
 
 experiment:
-    project: "rl_sdar_kl" # need to be same of this file name
+    project: "k1_in_reward" # need to be same of this file name
     function: "train"  # no need to change
-    start_from_scratch: True # set to True by default, if you stopped the training, and want to keep training with your ckpt model.optimized_name, set to False, and set current_epoch to the last step you stopped   
+    start_from_scratch: False # set to True by default, if you stopped the training, and want to keep training with your ckpt model.optimized_name, set to False, and set current_epoch to the last step you stopped   
     total_step: 80
     save_every: 20
     eval_every: 5
-    current_epoch: 1
-    deepspeed_file: "1_node_2_gpus_deepspeed_zero3"
+    current_epoch: 6
+    deepspeed_file: "1_node_4_gpus_deepspeed_zero3"
     num_node: 1
     node_index: 0
     is_debug: true
@@ -70,7 +72,8 @@ training:
     upper_p: 0.9
     eps: 0.20
     beta: 0.01
-    use_kl_estimator_k3: True
+    kl_estimator: "k1"   # "k1" "k2" "k3"
+    kl_mode: "in_reward"    # "in_loss" "in_reward"
 
 
 optimizer:
