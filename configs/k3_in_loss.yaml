@@ -2,7 +2,7 @@ wandb:
   entity: 'ruoyufang-uc-santa-barbara'
   resume: 'auto'
 #   run_name: "rl_sdar_k3"
-  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_22_1_36"
+  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_22_20_47"
   run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}"
   project: "kl"
 

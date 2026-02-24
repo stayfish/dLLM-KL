@@ -739,7 +739,7 @@ def main():
         else:
             raise ValueError(f"Unknown KL estimator: {estimator}")
 
-    kl_mode = config.training.get("kl_mode", "in_loss")
+    kl_mode = config.training.get("kl_mode", None)
 
     def forward_process(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
 
@@ -773,7 +773,7 @@ def main():
         kl_per_seq = torch.zeros(B, device=device)
         kl_mean = torch.zeros((), device=device)
         kl_loss = torch.tensor(0.0, device=device)
-        if beta > 0:
+        if beta > 0 and config.training.kl_estimator != "none":
             kl_tok = kl_estimator(log_ratio, p_mask, config.training.kl_estimator)
             kl_per_seq = (kl_tok * p_mask).sum(dim=1)   # (B,)
             kl_mean = (kl_per_seq / L1).mean()
@@ -783,9 +783,13 @@ def main():
         # --- PPO surrogate ---
         if kl_mode == "in_reward":
             adv_effective = adv - beta * kl_per_seq.detach()
-        else:
+        elif kl_mode == "in_loss":
             adv_effective = adv
             kl_loss = beta * (kl_per_seq / L1).sum() / B
+        elif kl_mode == "none":
+            adv_effective = adv
+        else:
+            raise ValueError(f"Unknown KL mode: {kl_mode}")
         adv_tok = adv_effective.unsqueeze(1)
 
         surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
