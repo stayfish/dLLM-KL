@@ -2,25 +2,26 @@ wandb:
   entity: 'ruoyufang-uc-santa-barbara'
   resume: 'auto'
 #   run_name: "rl_sdar_k3"
-  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_23_18_54"
-  run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}"
-  project: "kl"
-  desc: "fix ratio 没有找 unmask 的 bug"
+  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_bs${training.batch_size_lm}_accum${training.gradient_acc}_ngpus${experiment.num_gpus}_2_23_20_49"
+  run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_bs${training.batch_size_lm}_accum${training.gradient_accumulation_steps}_ngpus${experiment.num_gpus}"
+  desc: "增大了 batch_size，保证 total batch size = 256"
 
 
 
 experiment:
     project: "k3_in_loss" # need to be same of this file name
     function: "train"  # no need to change
+    num_gpus: 2
     start_from_scratch: True # set to True by default, if you stopped the training, and want to keep training with your ckpt model.optimized_name, set to False, and set current_epoch to the last step you stopped   
     total_step: 80
     save_every: 20
     eval_every: 5
     current_epoch: 1
-    deepspeed_file: "1_node_2_gpus_deepspeed_zero3"
+    deepspeed_file: "1_node_${experiment.num_gpus}_gpus_deepspeed_zero3"
     num_node: 1
     node_index: 0
     is_debug: true
+    main_process_port: 8830
 
 model:
     pretrained_model: "/mnt/nvme0n1/ligong/collab/ruoyu/cache/huggingface/hub/models--JetLM--SDAR-1.7B-Chat/snapshots/e2fcc4b23a0f353683809f47b80843c869841003" # absolute path of your model
@@ -57,7 +58,7 @@ execute:
 training:
     gradient_checkpointing_enable: True
     gradient_accumulation_steps: 32
-    batch_size_lm: 1
+    batch_size_lm: 4
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086

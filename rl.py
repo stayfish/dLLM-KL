@@ -135,12 +135,15 @@ if __name__ == "__main__":
                 script_name = "train_sdar_value.py"
             elif model_base == "trado":
                 script_name = "train_trado_value.py"
+        # Per-run port so multiple rl.py can run in parallel (set MAIN_PROCESS_PORT in each env)
+        main_port = config.experiment.get("main_process_port", 8899)
+        cprint(f"main_port: {main_port}", "green")
         subprocess.run(
             f'accelerate launch '
             f'--num_machines 1 '
             f'--machine_rank 0 '
             f'--main_process_ip 127.0.0.1 '
-            f'--main_process_port 8899 '
+            f'--main_process_port {main_port} '
             f'--config_file accelerate_configs/{config.experiment.deepspeed_file}.yaml '
             f'train/{script_name} '
             f'config=configs/{project_name}.yaml '
