@@ -2,9 +2,10 @@ wandb:
   entity: 'ruoyufang-uc-santa-barbara'
   resume: 'auto'
 #   run_name: "rl_sdar_k3"
-  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_22_20_47"
+  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_2_23_18_54"
   run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}"
   project: "kl"
+  desc: "fix ratio 没有找 unmask 的 bug"
 
 
 
@@ -16,7 +17,7 @@ experiment:
     save_every: 20
     eval_every: 5
     current_epoch: 1
-    deepspeed_file: "1_node_4_gpus_deepspeed_zero3"
+    deepspeed_file: "1_node_2_gpus_deepspeed_zero3"
     num_node: 1
     node_index: 0
     is_debug: true

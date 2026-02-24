@@ -763,8 +763,9 @@ def main():
         
         logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
 
-        log_ratio   = logp_new_tok - logp_old_tok
-        ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio)).clamp(-10.0, 10.0)
+        log_ratio = logp_new_tok - logp_old_tok
+        log_ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio))
+        ratio = log_ratio.clamp(-10.0, 10.0)
         ratio   = torch.exp(ratio)          # (B, T)
         clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
 
