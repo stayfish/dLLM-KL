@@ -10,8 +10,13 @@ __pycache__/
 venv/
 .env
 
+configs/*
+
 # 本地符号链接（机器相关路径）
 k1_in_reward
+k1_in_loss
+kl_baseline
+k3_in_reward
 k3_in_loss
 kl
 
