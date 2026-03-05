@@ -52,6 +52,7 @@ rollout:
     remasking_strategy: "low_confidence_dynamic" #"low_confidence_static""low_confidence_dynamic"
     dynamic_threshold: 0.9 # no use for "low_confidence_static"
     start_with_think: False
+    base_port: 29011
 
 execute:
     num_chunk: 128 # batch size of executing codes in coding eval tasks

@@ -2,8 +2,9 @@ wandb:
   entity: 'ruoyufang-uc-santa-barbara'
   resume: 'auto'
 #   run_name: "rl_sdar_k3"
-  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_bs${training.batch_size_lm}_accum${training.gradient_acc}_ngpus${experiment.num_gpus}_2_23_20_49"
+  run_id: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_bs${training.batch_size_lm}_accum${training.gradient_accumulation_steps}_ngpus${experiment.num_gpus}_2_23_22_02"
   run_name: "${model.model_base}_${training.kl_estimator}_${training.kl_mode}_bs${training.batch_size_lm}_accum${training.gradient_accumulation_steps}_ngpus${experiment.num_gpus}"
+  project: "kl"
   desc: "增大了 batch_size，保证 total batch size = 256"
 
 
@@ -51,6 +52,7 @@ rollout:
     remasking_strategy: "low_confidence_dynamic" #"low_confidence_static""low_confidence_dynamic"
     dynamic_threshold: 0.9 # no use for "low_confidence_static"
     start_with_think: False
+    base_port: 29030
 
 execute:
     num_chunk: 128 # batch size of executing codes in coding eval tasks

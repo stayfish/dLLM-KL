@@ -538,7 +538,8 @@ if __name__ == "__main__":
         ctx = mp.get_context("spawn")
         enforce_eager_local = False if tp > 1 else True
 
-        base_port = 29000
+        # base_port = 29000
+        base_port = config.rollout.get("base_port", 29000)
         store_ports = [base_port + g for g in range(ngroups)]
 
         out_q = ctx.Queue()
