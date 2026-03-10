@@ -113,7 +113,7 @@ if __name__ == "__main__":
         )
             
     
-    def train(i, target = None):
+    def train(i, training_method = None, target = None):
         if target is None:
             if model_base == "dream":
                 script_name = "rl_dream.py"
@@ -193,7 +193,7 @@ if __name__ == "__main__":
             train(i, target = "value")
             train(i, target = "policy")
         else:
-            train(i, target = None)
+            train(i, config.training.method, target = None)
 
         if i % config.experiment.eval_every == 0:
             if model_base == "sdar":
