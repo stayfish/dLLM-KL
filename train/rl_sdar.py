@@ -878,8 +878,9 @@ def main():
         # policy_loss = - (surrogate_seq.sum() / B)
 
         # --- total loss ---
-        G = config.rollout.get("num_response_per_task", 16)
-        divisor = G * L1 if loss_type == "dr_grpo" else G
+        # G = config.rollout.get("num_response_per_task", 16)
+        # divisor = G * L1 if loss_type == "dr_grpo" else G
+        divisor = L1 if loss_type == "dr_grpo" else 1
         policy_loss = - surrogate_seq / divisor
         total_loss = policy_loss + kl_loss
         total_loss = total_loss.mean()
