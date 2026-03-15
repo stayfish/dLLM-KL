@@ -435,10 +435,19 @@ def main():
 
 
     def get_mask(time_epsilon, B, L1, device, seed=2026):
-        torch.manual_seed(seed)
-        t = time_epsilon + (1 - time_epsilon) * torch.rand(B, device=device)
+        # Keep an independent RNG stream per device to avoid resetting global RNG.
+        if not hasattr(get_mask, "_generators"):
+            get_mask._generators = {}
+        device_key = str(device)
+        if device_key not in get_mask._generators:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(seed)
+            get_mask._generators[device_key] = gen
+        gen = get_mask._generators[device_key]
+
+        t = time_epsilon + (1 - time_epsilon) * torch.rand(B, device=device, generator=gen)
         p_mask = 1.0 - t.unsqueeze(1).expand(B, L1)
-        is_mask = torch.rand(B, L1, device=device) <= p_mask
+        is_mask = torch.rand(B, L1, device=device, generator=gen) <= p_mask
         return t, p_mask, is_mask
 
 
@@ -576,8 +585,8 @@ def main():
             extended_input_ids = torch.cat([input_ids, noisy_input_ids[:, start_pos:]], dim=1)
             extended_input_ids_list = torch.unbind(extended_input_ids, dim=0)
             pmask_list = torch.unbind(p_mask, dim=0)
-            G = config.rollout.get("num_response_per_task", 16)
-            reward_list = [reward[b] / G for b in range(B)]
+            # G = config.rollout.get("num_response_per_task", 16)
+            reward_list = [reward[b] for b in range(B)]
         
         else:
             raise NotImplementedError(f"Unknown method: {config.training.method}")
@@ -774,6 +783,8 @@ def main():
             return 0.5 * log_ratio_seq.pow(2)
         elif estimator == "k3":
             return (-log_ratio_seq).clamp(-10.0, 10.0).exp() - 1.0 + log_ratio_seq
+        else:
+            raise ValueError(f"Unknown KL estimator: {estimator}")
         
     def forward_process_old(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok, config=config):
         
@@ -829,66 +840,75 @@ def main():
         logp_new_seq = get_elbo(labels[:, L0:], logits[:, L0:], mask_ratio[:,L0:], p_mask[:,L0:])
         # lens = extended_input_ids[:, L0 + L1:].ne(pad_id).sum(dim=1)
         #  (B, )
-             # (B, T)
         log_ratio_seq = logp_new_seq - logp_old_seq
+        loss_type = config.training.get("loss_type", "dr_grpo")
+        # add loss normalization
         ratio = log_ratio_seq / L1
         ratio = ratio.clamp(-10.0, 10.0)
-        ratio   = torch.exp(ratio)          # (B, T)
-        clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
+        ratio   = torch.exp(ratio) # (B,)
+        clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps) # (B,)
 
          # --- KL computation ---
         beta = config.training.beta
         kl_per_seq = torch.zeros(B, device=device)
         kl_mean = torch.zeros((), device=device)
-        kl_loss = torch.tensor(0.0, device=device)
+        kl_loss = torch.zeros(B, device=device)
         if beta > 0 and config.training.kl_estimator != "none":
-            kl_seq = kl_estimator_seq(log_ratio_seq, config.training.kl_estimator)
-            # kl_mean = (kl_per_seq / L1).mean()
-            # kl_per_seq = (kl_tok * p_mask).sum(dim=1) / L1   # (B,)
-            # kl_mean = kl_per_seq.mean()
+            kl_per_seq = kl_estimator_seq(log_ratio_seq, config.training.kl_estimator)
+            kl_mean = kl_per_seq.mean()
 
         # --- PPO surrogate ---
         if kl_mode == "in_reward":
-            adv_effective = adv - beta * kl_seq.detach()
+            # adv_effective = adv - beta * kl_mean.detach()
+            adv_effective = adv - beta * kl_per_seq.detach()
         elif kl_mode == "in_loss":
             adv_effective = adv
-            kl_loss = beta * (kl_per_seq / L1).sum() / B
+            # kl_loss = beta * kl_mean
+            kl_loss = beta * kl_per_seq
         elif kl_mode == "none":
             adv_effective = adv
         else:
             raise ValueError(f"Unknown KL mode: {kl_mode}")
         adv_seq = adv_effective
 
-        surrogate_seq = torch.min(ratio * adv_seq, clipped * adv_seq)  # (B, T)
+        surrogate_seq = torch.min(ratio * adv_seq, clipped * adv_seq)  # (B,)
         # surrogate_seq = surrogate_seq * p_mask
         # surrogate_seq = surrogate_seq.sum(dim=1) / L1
 
-        policy_loss = - (surrogate_seq.sum() / B)
+        # policy_loss = - (surrogate_seq.sum() / B)
 
         # --- total loss ---
+        G = config.rollout.get("num_response_per_task", 16)
+        divisor = G * L1 if loss_type == "dr_grpo" else G
+        policy_loss = - surrogate_seq / divisor
         total_loss = policy_loss + kl_loss
+        total_loss = total_loss.mean()
+
 
         # --- metrics ---
-        # clip_mask = ((ratio - clipped).abs() > 1e-8) & p_mask
-        # clip_count = clip_mask.float().sum()
-        # clip_total = p_mask.float().sum()
+        clip_mask = ((ratio - clipped).abs() > 1e-8)
+        clip_count = clip_mask.float().sum()
 
-        # reward_mean = adv.mean()
-        # reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
-        # entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
-        # entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
+        reward_mean = adv.mean()
+        reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
+        adv_effective_mean = adv_effective.mean()
+        adv_effective_std = adv_effective.std(unbiased=False) if adv_effective.numel() > 1 else torch.zeros((), device=adv_effective.device)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+        entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
 
         metrics = {
             "loss/total": total_loss.detach(),
-            "loss/policy": policy_loss.detach(),
-            "loss/kl": torch.tensor(0.0, device=device),
-            "kl/mean": torch.tensor(0.0, device=device),
-            "policy/entropy": torch.tensor(0.0, device=device),
-            "advantage/mean": torch.tensor(0.0, device=device),
-            "advantage/std": torch.tensor(0.0, device=device),
-            "advantage/effective_mean": torch.tensor(0.0, device=device),
-            "clip_count": torch.tensor(0.0, device=device),
-            "clip_total": torch.tensor(0.0, device=device),
+            "loss/policy": policy_loss.mean().detach(),
+            "loss/kl": kl_loss.mean().detach(),
+            "kl/mean": kl_mean.detach(),
+            "policy/entropy": entropy_mean.detach(),
+            "adv_eff/mean": adv_effective_mean.detach(),
+            "adv_eff/std": adv_effective_std.detach(),
+            "adv/mean": reward_mean.detach(),
+            "adv/std": reward_std.detach(),
+            "clip_count": clip_count.detach(),
+            "clip_total": torch.tensor(float(B), device=device),
         }
 
         return total_loss, metrics
@@ -991,7 +1011,7 @@ def main():
             if accelerator.is_local_main_process and step <= 5:
                 print(f"[DEBUG] step={step} (local) raw loss/total={step_metrics['loss/total'].item():.6f}, "
                       f"loss/policy={step_metrics['loss/policy'].item():.6f}, "
-                      f"advantage/mean={step_metrics['advantage/mean'].item():.6f}")
+                      f"advantage/mean={step_metrics['adv/mean'].item():.6f}")
 
 
             for name, value in step_metrics.items():
