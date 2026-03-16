@@ -927,6 +927,8 @@ def main():
         surrogate_seq = torch.min(ratio * adv_seq, clipped * adv_seq)  # (B,)
         # surrogate_seq = surrogate_seq * p_mask
         # surrogate_seq = surrogate_seq.sum(dim=1) / L1
+        surrogate_abs_mean = surrogate_seq.abs().mean()
+        surrogate_pos_frac = (surrogate_seq > 0).float().mean()
 
         # policy_loss = - (surrogate_seq.sum() / B)
 
@@ -948,6 +950,10 @@ def main():
         reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
         adv_effective_mean = adv_effective.mean()
         adv_effective_std = adv_effective.std(unbiased=False) if adv_effective.numel() > 1 else torch.zeros((), device=adv_effective.device)
+        log_ratio_mean = log_ratio_seq.mean()
+        log_ratio_std = log_ratio_seq.std(unbiased=False) if log_ratio_seq.numel() > 1 else torch.zeros((), device=log_ratio_seq.device)
+        log_ratio_abs_mean = log_ratio_seq.abs().mean()
+        log_ratio_per_tok_mean = (log_ratio_seq / L1).mean()
         log_probs = F.log_softmax(logits, dim=-1)
         entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
         entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
@@ -956,8 +962,14 @@ def main():
             "loss/total": total_loss.detach(),
             "loss/policy": policy_loss.mean().detach(),
             "loss/kl": kl_loss.mean().detach(),
+            "policy/surr_abs_mean": surrogate_abs_mean.detach(),
+            "policy/surr_pos_frac": surrogate_pos_frac.detach(),
             "kl/mean": kl_mean.detach(),
             "policy/entropy": entropy_mean.detach(),
+            "log_ratio/seq_mean": log_ratio_mean.detach(),
+            "log_ratio/seq_std": log_ratio_std.detach(),
+            "log_ratio/seq_abs_mean": log_ratio_abs_mean.detach(),
+            "log_ratio/per_tok_mean": log_ratio_per_tok_mean.detach(),
             "adv_eff/mean": adv_effective_mean.detach(),
             "adv_eff/std": adv_effective_std.detach(),
             "adv/mean": reward_mean.detach(),
