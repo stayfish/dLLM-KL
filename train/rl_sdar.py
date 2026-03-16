@@ -490,6 +490,8 @@ def main():
                 
                 extended_input_ids_list.append(extended_input_ids_b)
                 pmask_list.append(pmask_b)
+
+            mask_ratio = torch.ones(B, L0 + L1, device=input_ids.device, dtype=torch.float)
             
         if config.training.method == "coupled":
 
@@ -535,6 +537,8 @@ def main():
             extended_input_ids_list += coupled_input_ids_list
             pmask_list += coupled_pmask_list
             reward_list += coupled_reward_list
+
+            mask_ratio = torch.ones(2 * B, L0 + L1, device=input_ids.device, dtype=torch.float)
         
         elif config.training.method == "TraceRL":
 
@@ -570,6 +574,55 @@ def main():
                     extended_input_ids_list.append(extended_b)
                     pmask_list.append(pmask_b)
                     reward_list.append(reward[b])
+
+            mask_ratio = torch.ones(len(extended_input_ids_list), L0 + L1, device=input_ids.device, dtype=torch.float)
+
+        elif config.training.method == "TraceESPO":
+            # 与 TraceRL 相同的多轮 step_map 生成，同时为每条样本构造 mask_ratio 供 ESPO loss 使用。
+            for b in range(B):
+                step_map_i = step_map_list[b]
+                for j in range(int((L1 - 1) / block_size) + 1):
+                    start = j * block_size
+                    end = min(L1, (j + 1) * block_size)
+                    step_map_list[b][start:end] = collapse_k_unique(step_map_i[start:end], config.training.shrink)
+
+            step_map = torch.as_tensor(step_map_list, dtype=torch.long)
+            assert step_map.shape[1] == L1
+
+            extended_input_ids_list, pmask_list, reward_list, mask_ratio_list = [], [], [], []
+
+            for b in range(B):
+                step_b = step_map[b]
+                while True:
+                    out = one_round_vectorized(
+                        input_ids_b=input_ids[b],
+                        step_map_b=step_b,
+                        L0=L0,
+                        L1=L1,
+                        block_size=block_size,
+                        mask_id=mask_id,
+                    )
+                    extended_b, pmask_b, step_b, has_any = out
+                    if not has_any:
+                        break
+
+                    extended_input_ids_list.append(extended_b)
+                    pmask_list.append(pmask_b)
+                    reward_list.append(reward[b])
+                    # mask_ratio: 每个分块内「预测位置数/该块长度」，与 ESPO get_elbo 的按块加权一致
+                    mask_ratio_b = torch.ones(L0 + L1, device=input_ids.device, dtype=torch.float)
+                    for j in range(int((L1 - 1) / block_size) + 1):
+                        start = j * block_size
+                        end = min(L1, (j + 1) * block_size)
+                        block_len = end - start
+                        n_pred = pmask_b[L0 + start : L0 + end].sum().item()
+                        ratio = (n_pred / block_len) if block_len > 0 else 1.0
+                        if ratio <= 0:
+                            ratio = 1.0
+                        mask_ratio_b[L0 + start : L0 + end] = ratio
+                    mask_ratio_list.append(mask_ratio_b)
+
+            mask_ratio = torch.stack(mask_ratio_list, dim=0)
 
         elif config.training.method == "ESPO":
             time_epsilon = config.training.get("time_epsilon", 1e-3)
@@ -704,7 +757,7 @@ def main():
 
             logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
             logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
-            if config.training.method == "ESPO":
+            if config.training.method in ("ESPO", "TraceESPO"):
                 elbo = get_elbo(labels[:, L0:], logits[:, L0:], mask_ratio[:,L0:], p_mask[:,L0:])
                 dataset.logp_old_seq[ids] = elbo.float().cpu()
             else:
@@ -880,8 +933,9 @@ def main():
         # --- total loss ---
         # G = config.rollout.get("num_response_per_task", 16)
         # divisor = G * L1 if loss_type == "dr_grpo" else G
-        divisor = L1 if loss_type == "dr_grpo" else 1
-        policy_loss = - surrogate_seq / divisor
+        # divisor = L1 if loss_type == "dr_grpo" else 1
+        # policy_loss = - surrogate_seq / divisor
+        policy_loss = - surrogate_seq
         total_loss = policy_loss + kl_loss
         total_loss = total_loss.mean()
 
@@ -981,7 +1035,7 @@ def main():
             labels = batch["labels"].to(accelerator.device)
             reward = batch["reward"]
             mask_ratio = batch["mask_ratio"].to(accelerator.device)
-            if config.training.method == "ESPO":
+            if config.training.method in ("ESPO", "TraceESPO"):
                 old_lp = dataset_lm.logp_old_seq[batch["ids"].cpu()].to(accelerator.device)
             else:
                 old_lp = dataset_lm.logp_old_tok[batch["ids"].cpu()].to(accelerator.device)
@@ -989,7 +1043,7 @@ def main():
             if torch.isneginf(old_lp).any().item():
                 print(old_lp)
 
-            if config.training.method == "ESPO":
+            if config.training.method in ("ESPO", "TraceESPO"):
                 loss_lm, step_metrics = forward_process_espo(
                     extended_input_ids=extended_input_ids,
                     p_mask=p_mask,
@@ -1058,6 +1112,29 @@ def main():
                 metric_totals.clear()
                 metric_counts.clear()
                 
+
+        # 若 batch 数少于 gradient_accumulation_steps，循环内从未做 optimizer step，在此补做一次
+        if step > 0 and step % accelerator.gradient_accumulation_steps != 0:
+            if config.training.max_grad_norm is not None:
+                accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+            for name, total_val in metric_totals.items():
+                epoch_metric_totals[name] += total_val
+            for name, count_val in metric_counts.items():
+                epoch_metric_counts[name] += count_val
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            global_step += 1
+            log_dict = calculate_metrics(metric_totals, metric_counts)
+            if lr_scheduler is not None:
+                log_dict["lr"] = lr_scheduler.get_last_lr()[0]
+            if log_dict:
+                log_to_console(log_dict, "global_step", global_step)
+                if accelerator.is_main_process and "loss/total" in log_dict:
+                    progress_bar.set_postfix({"loss": f"{log_dict['loss/total']:.4f}"})
+            metric_totals.clear()
+            metric_counts.clear()
 
         accelerator.wait_for_everyone()
 
