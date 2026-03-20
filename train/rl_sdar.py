@@ -839,8 +839,8 @@ def main():
         else:
             raise ValueError(f"Unknown KL estimator: {estimator}")
         
-    def forward_process_old(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok, config=config):
-        
+    def forward_process_old(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
+
         adv = torch.as_tensor(
             adv, device=extended_input_ids.device, dtype=torch.float32
         ).detach()
@@ -849,26 +849,73 @@ def main():
         L0    = start_pos
         L1    = L - L0
         device = extended_input_ids.device
+
         attention_mask = basic_block_attention.clone()
         attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
         attention_mask = process_pad(attention_mask, extended_input_ids)
+
         logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
         logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
-        log_probs = F.log_softmax(logits, dim=-1)
-        logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
-        log_ratio = logp_new_tok - logp_old_tok
-        kl_level = config.training.get("kl_level", None)
-        if kl_level == "token":
-            kl_tok = kl_estimator(log_ratio, p_mask, config.training.kl_estimator)
-            kl_per_seq = (kl_tok * p_mask).sum(dim=1)   # (B,)
-            kl_mean = (kl_per_seq / L1).mean()
-        elif kl_level == "sequence":
-            kl_seq = (logp_new_tok - logp_old_tok).sum(dim=1)   # (B,)
-            kl_mean = kl_seq.mean()
-        else:
-            pass
 
-        return logp_new_tok, log_ratio
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
+
+        ratio   = logp_new_tok - logp_old_tok
+        ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        ratio   = torch.exp(ratio)          # (B, T)
+        clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
+
+        adv_tok = adv.unsqueeze(1)
+
+        surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
+        surrogate_tok = surrogate_tok * p_mask
+
+        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
+        surrogate_tok = surrogate_tok.sum(dim=1) / L1
+
+        policy_loss = - (surrogate_tok.sum() / B)
+
+        # KL penalty (optional)
+        kl_loss = torch.tensor(0.0, device=policy_loss.device)
+        kl_mean = torch.zeros((), device=policy_loss.device)
+        if config.training.beta > 0:
+            kl_seq = logp_new_tok - logp_old_tok
+            kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
+            if config.training.use_kl_estimator_k3:
+                t = (-kl_seq).clamp(-10.0, 10.0)
+                kl_seq = t.exp() - 1.0 + kl_seq
+            elif config.training.use_kl_estimator_k2:
+                kl_seq = 0.5 * kl_seq.pow(2)
+
+            kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
+            kl_mean = kl_seq.mean()
+            kl_loss = config.training.beta * kl_seq.sum() / B
+            total_loss = policy_loss + kl_loss
+        else:
+            total_loss = policy_loss
+        
+        clip_mask = ((ratio - clipped).abs() > 1e-8) & p_mask
+        clip_count = clip_mask.float().sum()
+        clip_total = p_mask.float().sum()
+
+        reward_mean = adv.mean()
+        reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
+        entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+        entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
+
+        metrics = {
+            "loss/total": total_loss.detach(),
+            "loss/policy": policy_loss.detach(),
+            "loss/kl": kl_loss.detach(),
+            "kl/mean": kl_mean.detach(),
+            "policy/entropy": entropy_mean.detach(),
+            "advantage/mean": reward_mean.detach(),
+            "clip_count": clip_count.detach(),
+            "clip_total": clip_total.detach(),
+        }
+
+        return total_loss, metrics
 
     def forward_process_espo(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_seq, mask_ratio):
 

@@ -18,6 +18,10 @@ k1_in_loss
 kl_baseline
 k3_in_reward
 k3_in_loss
+espo_k1_in_loss
+espo_k1_in_reward
+espo_k3_in_loss
+espo_k2_in_loss
 kl
 
 # 运行输出与临时数据
