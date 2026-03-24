@@ -12,6 +12,11 @@ def get_config():
     return conf, cli_conf.config
 
 if __name__ == "__main__":
+    if os.environ.get("DEBUG_MODE", "false").lower() == "true":
+        import debugpy
+        debugpy.connect(5678)
+        cprint(f"[debugpy] waiting for client to attach...", color="green")
+
     config, config_path = get_config()
 
     project_name = config.experiment.project
@@ -22,15 +27,24 @@ if __name__ == "__main__":
 
         # Log the full resolved config for reproducibility.
         wandb_cfg = OmegaConf.to_container(config, resolve=True)
+        
+        wandb_project = config.wandb.get("project", "kl-eval")
+        wandb_run_name = config.wandb.get("run_name", None)
         wandb_run = wandb.init(
-            project=project_name,
-            name=project_name,
+            project=wandb_project,
+            entity=config.wandb.get("entity", None),
+            name=wandb_run_name,
+            id=config.wandb.get("run_id", None),
             config=wandb_cfg,
+        )
+        cprint(
+            f"[wandb] init entity={wandb_run.entity}, project={wandb_run.project}, run={wandb_run.name}",
+            color="green",
         )
 
         # Save the config file as an artifact (best-effort, skip if file missing).
         if config_path and os.path.exists(config_path):
-            cfg_art = wandb.Artifact(name=f"{project_name}-config", type="eval_config")
+            cfg_art = wandb.Artifact(name=f"{wandb_run_name}", type=f"{wandb_project}-config")
             cfg_art.add_file(config_path)
             wandb_run.log_artifact(cfg_art)
     except Exception as e:
@@ -140,7 +154,7 @@ if __name__ == "__main__":
                 if log_dict:
                     wandb_run.log(log_dict)
 
-                res_art = wandb.Artifact(name=f"{project_name}-results", type="eval_results")
+                res_art = wandb.Artifact(name=f"{wandb_run_name}", type=f"{wandb_project}-results")
                 res_art.add_file(results_path)
                 wandb_run.log_artifact(res_art)
         except Exception as e:

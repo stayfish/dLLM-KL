@@ -13,22 +13,33 @@ def get_config():
 
 if __name__ == "__main__":
     config, config_path = get_config()
+    if os.environ.get("DEBUG_MODE", "false").lower() == "true":
+        import debugpy
+        debugpy.connect(5678)
+        cprint(f"[debugpy] waiting for client to attach...", color="green")
 
     project_name = config.experiment.project
     eval_type = config.dataset.data_type
     wandb_run = None
     try:
         import wandb
-
+        wandb_project = config.wandb.get("project", "kl-eval")
         wandb_cfg = OmegaConf.to_container(config, resolve=True)
+        run_name = config.wandb.get("run_name", None)
         wandb_run = wandb.init(
-            project=project_name,
-            name=project_name,
+            project=wandb_project,
+            name=config.wandb.get("run_name", None),
+            id=config.wandb.get("run_id", None),
+            entity=config.wandb.get("entity", None),
             config=wandb_cfg,
+        )
+        cprint(
+            f"[wandb] init entity={wandb_run.entity}, project={wandb_run.project}, run={wandb_run.name}",
+            color="green",
         )
 
         if config_path and os.path.exists(config_path):
-            cfg_art = wandb.Artifact(name=f"{project_name}-config", type="eval_config")
+            cfg_art = wandb.Artifact(name=f"{run_name}", type=f"{wandb_project}-config")
             cfg_art.add_file(config_path)
             wandb_run.log_artifact(cfg_art)
     except Exception as e:
@@ -156,8 +167,8 @@ if __name__ == "__main__":
 
                     # Also attach the results text file for traceability.
                     res_art = wandb.Artifact(
-                        name=f"{project_name}-results-{strategy}",
-                        type="eval_results",
+                        name=f"{run_name}",
+                        type=f"{wandb_project}-results",
                     )
                     res_art.add_file(results_path)
                     wandb_run.log_artifact(res_art)
