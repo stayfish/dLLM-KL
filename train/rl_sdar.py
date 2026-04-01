@@ -828,7 +828,7 @@ def main():
 
     kl_mode = config.training.get("kl_mode", None)
 
-    def kl_estimator_seq(log_ratio_seq, estimator):
+    def kl_estimator(log_ratio_seq, estimator):
         """Per-sequence KL divergence.  delta = logp_new - logp_old."""
         if estimator == "k1":
             return log_ratio_seq.clamp(-10.0, 10.0)
@@ -839,7 +839,7 @@ def main():
         else:
             raise ValueError(f"Unknown KL estimator: {estimator}")
         
-    def forward_process_old(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
+    def forward_process_token(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
 
         adv = torch.as_tensor(
             adv, device=extended_input_ids.device, dtype=torch.float32
@@ -861,39 +861,67 @@ def main():
         
         logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
 
-        ratio   = logp_new_tok - logp_old_tok
-        ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        # ratio   = logp_new_tok - logp_old_tok
+        log_ratio = logp_new_tok - logp_old_tok
+        # ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio)).clamp(-10.0, 10.0)
         ratio   = torch.exp(ratio)          # (B, T)
         clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
 
-        adv_tok = adv.unsqueeze(1)
-
-        surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
-        surrogate_tok = surrogate_tok * p_mask
-
-        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
-        surrogate_tok = surrogate_tok.sum(dim=1) / L1
-
-        policy_loss = - (surrogate_tok.sum() / B)
+        
 
         # KL penalty (optional)
-        kl_loss = torch.tensor(0.0, device=policy_loss.device)
-        kl_mean = torch.zeros((), device=policy_loss.device)
+        # kl_loss = torch.tensor(0.0, device=policy_loss.device)
+        # kl_mean = torch.zeros((), device=policy_loss.device)
+        kl_loss = torch.tensor(0.0, device=device)
+        kl_mean = torch.zeros((), device=device)
+        kl_estimator_type = config.training.get("kl_estimator", "k1")
+        kl_mode = config.training.get("kl_mode", "in_loss")
         if config.training.beta > 0:
             kl_seq = logp_new_tok - logp_old_tok
             kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
-            if config.training.use_kl_estimator_k3:
-                t = (-kl_seq).clamp(-10.0, 10.0)
-                kl_seq = t.exp() - 1.0 + kl_seq
-            elif config.training.use_kl_estimator_k2:
-                kl_seq = 0.5 * kl_seq.pow(2)
+            # if config.training.get("use_kl_estimator_k3", True):
+            #     t = (-kl_seq).clamp(-10.0, 10.0)
+            #     kl_seq = t.exp() - 1.0 + kl_seq
+            # elif config.training.use_kl_estimator_k2:
+            #     kl_seq = 0.5 * kl_seq.pow(2)
+            kl_seq = kl_estimator(kl_seq, kl_estimator_type)
 
             kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
             kl_mean = kl_seq.mean()
             kl_loss = config.training.beta * kl_seq.sum() / B
+
+
+        adv_tok = adv.unsqueeze(1)
+        if kl_mode == "in_reward":
+            adv_eff_tok = adv_tok - kl_loss.detach()
+        elif kl_mode == "in_loss":
+            adv_eff_tok = adv_tok
+        else:
+            raise ValueError(f"Unknown KL mode: {kl_mode}")
+
+        # surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
+        surrogate_tok = torch.min(ratio * adv_eff_tok, clipped * adv_eff_tok)  # (B, T)
+        surrogate_tok = surrogate_tok * p_mask
+
+        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
+        surrogate_tok = surrogate_tok.sum(dim=1) / L1
+    
+        policy_loss = - (surrogate_tok.sum() / B)
+        if kl_mode == "in_loss":
             total_loss = policy_loss + kl_loss
         else:
             total_loss = policy_loss
+
+        # --- metrics ---
+        surrogate_tok_abs_mean = surrogate_tok.abs().mean()
+        surrogate_tok_pos_frac = (surrogate_tok > 0).float().mean()
+
+        log_ratio_tok_mean = log_ratio.mean()
+        log_ratio_tok_std = log_ratio.std(unbiased=False) if log_ratio.numel() > 1 else torch.zeros((), device=log_ratio.device)
+        log_ratio_tok_abs_mean = log_ratio.abs().mean()
+        log_ratio_tok_per_tok_mean = (log_ratio / L1).mean()
+
         
         clip_mask = ((ratio - clipped).abs() > 1e-8) & p_mask
         clip_count = clip_mask.float().sum()
@@ -908,9 +936,18 @@ def main():
             "loss/total": total_loss.detach(),
             "loss/policy": policy_loss.detach(),
             "loss/kl": kl_loss.detach(),
+            "policy/surr_abs_mean": surrogate_tok_abs_mean.detach(),
+            "policy/surr_pos_frac": surrogate_tok_pos_frac.detach(),
             "kl/mean": kl_mean.detach(),
             "policy/entropy": entropy_mean.detach(),
-            "advantage/mean": reward_mean.detach(),
+            "log_ratio/tok_mean": log_ratio_tok_mean.detach(),
+            "log_ratio/tok_std": log_ratio_tok_std.detach(),
+            "log_ratio/tok_abs_mean": log_ratio_tok_abs_mean.detach(),
+            "log_ratio/per_tok_mean": log_ratio_tok_per_tok_mean.detach(),
+            "adv_eff/mean": adv_eff_tok.mean().detach(),
+            "adv_eff/std": adv_eff_tok.std(unbiased=False) if adv_eff_tok.numel() > 1 else torch.zeros((), device=adv_eff_tok.device).detach(),
+            "adv/mean": reward_mean.detach(),
+            "adv/std": reward_std.detach(),
             "clip_count": clip_count.detach(),
             "clip_total": clip_total.detach(),
         }
@@ -954,7 +991,7 @@ def main():
         kl_mean = torch.zeros((), device=device)
         kl_loss = torch.zeros(B, device=device)
         if beta > 0 and config.training.kl_estimator != "none":
-            kl_per_seq = kl_estimator_seq(log_ratio_seq, config.training.kl_estimator)
+            kl_per_seq = kl_estimator(log_ratio_seq, config.training.kl_estimator)
             kl_mean = kl_per_seq.mean()
 
         # --- PPO surrogate ---
@@ -1112,7 +1149,7 @@ def main():
                     logp_old_seq=old_lp,
                     mask_ratio=mask_ratio)
             else:
-                loss_lm, step_metrics = forward_process_old(
+                loss_lm, step_metrics = forward_process_token(
                     extended_input_ids=extended_input_ids,
                     p_mask=p_mask,
                     tok_idx_ext=tok_idx_ext,
