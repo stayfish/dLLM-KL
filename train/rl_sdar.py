@@ -839,7 +839,7 @@ def main():
         else:
             raise ValueError(f"Unknown KL estimator: {estimator}")
         
-    def forward_process_token(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
+    def forward_process_token(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok, mask_ratio):
 
         adv = torch.as_tensor(
             adv, device=extended_input_ids.device, dtype=torch.float32
@@ -857,6 +857,7 @@ def main():
         logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
         logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
 
+        elbo = get_elbo(labels[:, L0:], logits[:, L0:], mask_ratio[:,L0:], p_mask[:,L0:])
         log_probs = F.log_softmax(logits, dim=-1)
         
         logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
@@ -931,6 +932,8 @@ def main():
         reward_std = adv.std(unbiased=False) if adv.numel() > 1 else torch.zeros((), device=adv.device)
         entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
         entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
+        elbo_mean = elbo.mean()
+        elbo_std = elbo.std(unbiased=False) if elbo.numel() > 1 else torch.zeros((), device=elbo.device)
 
         metrics = {
             "loss/total": total_loss.detach(),
@@ -950,6 +953,8 @@ def main():
             "adv/std": reward_std.detach(),
             "clip_count": clip_count.detach(),
             "clip_total": clip_total.detach(),
+            "elbo/mean": elbo_mean.detach(),
+            "elbo/std": elbo_std.detach(),
         }
 
         return total_loss, metrics
@@ -1041,6 +1046,8 @@ def main():
         log_probs = F.log_softmax(logits, dim=-1)
         entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
         entropy_mean = (entropy * p_mask).sum() / p_mask.sum().clamp(min=1)
+        elbo_mean = logp_new_seq.mean()
+        elbo_std = logp_new_seq.std(unbiased=False) if logp_new_seq.numel() > 1 else torch.zeros((), device=logp_new_seq.device)
 
         metrics = {
             "loss/total": total_loss.detach(),
@@ -1060,6 +1067,8 @@ def main():
             "adv/std": reward_std.detach(),
             "clip_count": clip_count.detach(),
             "clip_total": torch.tensor(float(B), device=device),
+            "elbo/mean": elbo_mean.detach(),
+            "elbo/std": elbo_std.detach(),
         }
 
         return total_loss, metrics
@@ -1155,7 +1164,8 @@ def main():
                     tok_idx_ext=tok_idx_ext,
                     labels=labels,
                     adv=reward,
-                    logp_old_tok=old_lp
+                    logp_old_tok=old_lp,
+                    mask_ratio=mask_ratio
                 )
             loss_lm = loss_lm / accelerator.gradient_accumulation_steps
 

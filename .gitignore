@@ -11,6 +11,7 @@ venv/
 .env
 
 # configs/*
+configs/baseline.yaml
 
 # 本地符号链接（机器相关路径）
 k1_in_reward
