@@ -136,7 +136,8 @@ if __name__ == "__main__":
         if config.experiment.function == "train":
 
             proportion = sum(correctness) / len(correctness)
-            if proportion > 0.8 or proportion < 0.2:
+            is_debug = config.experiment.is_debug
+            if (proportion > 0.8 or proportion < 0.2) and (not is_debug):
                 dropped_groups += 1
                 continue
             kept_groups += 1

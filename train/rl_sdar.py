@@ -16,6 +16,7 @@ from PIL import Image
 from omegaconf import OmegaConf
 import wandb
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 
 from transformers import AutoTokenizer
@@ -27,6 +28,11 @@ from accelerate.utils import DistributedType, set_seed
 
 from models import SDARForCausalLM
 from train.prompting_utils import UniversalPrompting
+from train.rl_sdar_method_registry import (
+    RLBuildContext,
+    RLTrainStepContext,
+    get_rl_sdar_method_handler,
+)
 from models.lr_schedulers import get_scheduler
 from models.logging import set_verbosity_info, set_verbosity_error
 
@@ -51,35 +57,35 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 
-class TrainDataset(Dataset):
-    def __init__(self, extended_input_ids, p_mask, tok_idx_ext, labels, reward, mask_ratio):
-        self.extended_input_ids = extended_input_ids
-        self.p_mask = p_mask
-        self.tok_idx_ext = tok_idx_ext
-        self.labels = labels
-        self.reward   = reward
-        self.mask_ratio = mask_ratio
-        self.logp_old_tok = torch.full(
-            (len(extended_input_ids), p_mask.shape[1]), 
-            float('-inf')
-        )
-        self.logp_old_seq = torch.full(
-            (len(extended_input_ids),), float('-inf')
-        )
+# class TrainDataset(Dataset):
+#     def __init__(self, extended_input_ids, p_mask, tok_idx_ext, labels, reward, mask_ratio):
+#         self.extended_input_ids = extended_input_ids
+#         self.p_mask = p_mask
+#         self.tok_idx_ext = tok_idx_ext
+#         self.labels = labels
+#         self.reward   = reward
+#         self.mask_ratio = mask_ratio
+#         self.logp_old_tok = torch.full(
+#             (len(extended_input_ids), p_mask.shape[1]), 
+#             float('-inf')
+#         )
+#         self.logp_old_seq = torch.full(
+#             (len(extended_input_ids),), float('-inf')
+#         )
 
-    def __len__(self):
-        return len(self.extended_input_ids)
+#     def __len__(self):
+#         return len(self.extended_input_ids)
 
-    def __getitem__(self, idx):
-        return (
-            idx,
-            self.extended_input_ids[idx],
-            self.p_mask[idx],
-            self.tok_idx_ext[idx],
-            self.labels[idx],
-            self.reward[idx],
-            self.mask_ratio[idx],
-        )
+#     def __getitem__(self, idx):
+#         return (
+#             idx,
+#             self.extended_input_ids[idx],
+#             self.p_mask[idx],
+#             self.tok_idx_ext[idx],
+#             self.labels[idx],
+#             self.reward[idx],
+#             self.mask_ratio[idx],
+#         )
 
 
 def main():
@@ -229,19 +235,19 @@ def main():
 
 
 
-    def collapse_k_unique(lst, k: int):
-        if k <= 0:
-            raise ValueError("k must be > 0")
-        uniq = sorted(set(lst))
+    # def collapse_k_unique(lst, k: int):
+    #     if k <= 0:
+    #         raise ValueError("k must be > 0")
+    #     uniq = sorted(set(lst))
 
-        mapping = {}
-        n = len(uniq)
-        for idx, val in enumerate(uniq):
-            group = idx // k
-            end_idx = min((group + 1) * k - 1, n - 1)
-            rep = uniq[end_idx]
-            mapping[val] = rep
-        return [mapping[x] for x in lst]
+    #     mapping = {}
+    #     n = len(uniq)
+    #     for idx, val in enumerate(uniq):
+    #         group = idx // k
+    #         end_idx = min((group + 1) * k - 1, n - 1)
+    #         rep = uniq[end_idx]
+    #         mapping[val] = rep
+    #     return [mapping[x] for x in lst]
     
     
 
@@ -252,17 +258,17 @@ def main():
     logger.info("Creating dataloaders and lr_scheduler")
 
 
-    def simple_collate(batch):
-        idx, extended_input_ids, p_mask, tok_idx_ext, labels, reward, mask_ratio = zip(*batch)
-        return {
-            "ids":        torch.tensor(idx),
-            "extended_input_ids":  torch.stack(extended_input_ids),
-            "p_mask":  torch.stack(p_mask),
-            "tok_idx_ext":  torch.stack(tok_idx_ext),
-            "labels":  torch.stack(labels),
-            "reward":     reward,
-            "mask_ratio": torch.stack(mask_ratio),
-        }
+    # def simple_collate(batch):
+    #     idx, extended_input_ids, p_mask, tok_idx_ext, labels, reward, mask_ratio = zip(*batch)
+    #     return {
+    #         "ids":        torch.tensor(idx),
+    #         "extended_input_ids":  torch.stack(extended_input_ids),
+    #         "p_mask":  torch.stack(p_mask),
+    #         "tok_idx_ext":  torch.stack(tok_idx_ext),
+    #         "labels":  torch.stack(labels),
+    #         "reward":     reward,
+    #         "mask_ratio": torch.stack(mask_ratio),
+    #     }
     
 
 
@@ -372,66 +378,94 @@ def main():
 
         return attn
 
-
-    def one_round_vectorized(input_ids_b, step_map_b, L0, L1, block_size, mask_id):
+    def get_elbo(response_ids, response_logits, mask_ratio, is_mask):
         """
-        Perform a single "round" on one sample b:
-        - For each block, take the minimum non -1 value in step_map.
-        - Create pmask (positions equal to the block minimum).
-        - Create a noise mask for the extended segment (positions >= block minimum).
-        - Mark the chosen minimum positions in step_map as -1 for the next round.
-
-        Returns:
-        extended_input_ids_b : Tensor with duplicated + masked response segment
-        pmask_b              : Boolean mask for tokens selected in this round
-        new_step_map_b       : Updated step_map (selected positions set to -1)
-        has_any              : Whether any position was selected in this round
+        Return per-sample ELBO-like score with shape (B,).
+        We use the average log-probability on masked response tokens.
         """
-        device = input_ids_b.device
-        NB = (L1 + block_size - 1) // block_size
-        pad_len = NB * block_size - L1
+        token_log_probs = F.log_softmax(response_logits, dim=-1).gather(
+            dim=-1, index=response_ids.unsqueeze(-1)
+        ).squeeze(-1)  # (B, L1)
+        weighted_token_log_probs = token_log_probs.masked_fill_(~is_mask, 0) / mask_ratio
+        return weighted_token_log_probs.sum(dim=1)
 
-        # Reshape step_map into [NB, block_size], fill last incomplete block with -1
-        step_pad = torch.full((NB * block_size,), -1, dtype=torch.long, device=device)
-        step_pad[:L1] = step_map_b
-        step_blk = step_pad.view(NB, block_size)                      # [NB, Bk]
+    kl_mode = config.training.get("kl_mode", None)
 
-        valid = step_blk.ge(0)                                        # Valid positions (not -1)
-        big = torch.iinfo(step_blk.dtype).max
-        tmp = step_blk.masked_fill(~valid, big)                       # Fill invalid positions with a large value
-        min_vals, _ = tmp.min(dim=1, keepdim=True)                    # Current minimum for each block
+    def kl_estimator(log_ratio_seq, estimator, log_ratio_old=None):
+        """Per-sequence KL divergence.  delta = logp_new - logp_old."""
+        if estimator == "k1":
+            return log_ratio_seq.clamp(-10.0, 10.0)
+        elif estimator == "k2":
+            return 0.5 * log_ratio_seq.pow(2)
+        elif estimator == "k3":
+            return (-log_ratio_seq).clamp(-10.0, 10.0).exp() - 1.0 + log_ratio_seq
+        elif estimator == "rb":
+            if log_ratio_old is None:
+                raise ValueError("log_ratio_old is required for RB estimator")
+            return torch.sum(torch.exp(log_ratio_seq) * (log_ratio_seq - log_ratio_old))
+        else:
+            raise ValueError(f"Unknown KL estimator: {estimator}")
 
-        # Select positions equal to block minimum (only valid positions)
-        pmask_blk = step_blk.eq(min_vals) & valid                     
-        if not pmask_blk.any():
-            # No positions left to select in this round
-            return None, None, step_map_b, False
 
-        # Noise mask for extended segment: mark positions >= block minimum
-        ge_mask_blk = step_blk.ge(min_vals) & valid                   # [NB, Bk]
+    # def one_round_vectorized(input_ids_b, step_map_b, L0, L1, block_size, mask_id):
+    #     """
+    #     Perform a single "round" on one sample b:
+    #     - For each block, take the minimum non -1 value in step_map.
+    #     - Create pmask (positions equal to the block minimum).
+    #     - Create a noise mask for the extended segment (positions >= block minimum).
+    #     - Mark the chosen minimum positions in step_map as -1 for the next round.
 
-        # Flatten back to length L1 (discard padding)
-        pmask_tail = pmask_blk.view(-1)[:L1]                          # [L1]
-        ge_mask_tail = ge_mask_blk.view(-1)[:L1]                      # [L1]
+    #     Returns:
+    #     extended_input_ids_b : Tensor with duplicated + masked response segment
+    #     pmask_b              : Boolean mask for tokens selected in this round
+    #     new_step_map_b       : Updated step_map (selected positions set to -1)
+    #     has_any              : Whether any position was selected in this round
+    #     """
+    #     device = input_ids_b.device
+    #     NB = (L1 + block_size - 1) // block_size
+    #     pad_len = NB * block_size - L1
 
-        # Construct pmask_b: [0:L0] = False, [L0:] = pmask_tail
-        pmask_b = torch.zeros(L0 + L1, dtype=torch.bool, device=device)
-        pmask_b[L0:] = pmask_tail
+    #     # Reshape step_map into [NB, block_size], fill last incomplete block with -1
+    #     step_pad = torch.full((NB * block_size,), -1, dtype=torch.long, device=device)
+    #     step_pad[:L1] = step_map_b
+    #     step_blk = step_pad.view(NB, block_size)                      # [NB, Bk]
 
-        # Build extended segment: duplicate response and replace noise positions with mask_id
-        tail = input_ids_b[L0:L0+L1].clone()
-        tail[ge_mask_tail] = mask_id
+    #     valid = step_blk.ge(0)                                        # Valid positions (not -1)
+    #     big = torch.iinfo(step_blk.dtype).max
+    #     tmp = step_blk.masked_fill(~valid, big)                       # Fill invalid positions with a large value
+    #     min_vals, _ = tmp.min(dim=1, keepdim=True)                    # Current minimum for each block
+
+    #     # Select positions equal to block minimum (only valid positions)
+    #     pmask_blk = step_blk.eq(min_vals) & valid                     
+    #     if not pmask_blk.any():
+    #         # No positions left to select in this round
+    #         return None, None, step_map_b, False
+
+    #     # Noise mask for extended segment: mark positions >= block minimum
+    #     ge_mask_blk = step_blk.ge(min_vals) & valid                   # [NB, Bk]
+
+    #     # Flatten back to length L1 (discard padding)
+    #     pmask_tail = pmask_blk.view(-1)[:L1]                          # [L1]
+    #     ge_mask_tail = ge_mask_blk.view(-1)[:L1]                      # [L1]
+
+    #     # Construct pmask_b: [0:L0] = False, [L0:] = pmask_tail
+    #     pmask_b = torch.zeros(L0 + L1, dtype=torch.bool, device=device)
+    #     pmask_b[L0:] = pmask_tail
+
+    #     # Build extended segment: duplicate response and replace noise positions with mask_id
+    #     tail = input_ids_b[L0:L0+L1].clone()
+    #     tail[ge_mask_tail] = mask_id
 
         
-        extended_input_ids_b = torch.empty(L0 + L1 + L1, dtype=input_ids_b.dtype, device=device)
-        extended_input_ids_b[:L0+L1] = input_ids_b
-        extended_input_ids_b[L0+L1:] = tail
+    #     extended_input_ids_b = torch.empty(L0 + L1 + L1, dtype=input_ids_b.dtype, device=device)
+    #     extended_input_ids_b[:L0+L1] = input_ids_b
+    #     extended_input_ids_b[L0+L1:] = tail
 
-        # Update step_map: mark selected minimum positions as -1 for the next round
-        new_step_map_b = step_map_b.clone()
-        new_step_map_b[pmask_tail] = -1
+    #     # Update step_map: mark selected minimum positions as -1 for the next round
+    #     new_step_map_b = step_map_b.clone()
+    #     new_step_map_b[pmask_tail] = -1
 
-        return extended_input_ids_b, pmask_b, new_step_map_b, True
+    #     return extended_input_ids_b, pmask_b, new_step_map_b, True
 
 
     def get_mask(time_epsilon, B, L1, device, seed=2026):
@@ -460,7 +494,6 @@ def main():
 
         lower = config.training.lower_p
         upper = config.training.upper_p
-
 
         
         if config.training.method == "random_masking":
@@ -555,7 +588,7 @@ def main():
             assert step_map.shape[1] == L1
 
             extended_input_ids_list, pmask_list, reward_list = [], [], []
-
+            mask_ratio_list = []
             for b in range(B):
                 step_b = step_map[b]
                 while True:
@@ -575,7 +608,17 @@ def main():
                     pmask_list.append(pmask_b)
                     reward_list.append(reward[b])
 
-            mask_ratio = torch.ones(len(extended_input_ids_list), L0 + L1, device=input_ids.device, dtype=torch.float)
+                    t_b = torch.zeros(L0 + L1, device=input_ids.device, dtype=torch.float)
+                    for j in range(int((L1 - 1) / block_size) + 1):
+                        start = j * block_size
+                        end = min(L1, (j + 1) * block_size)
+                        block_len = end - start
+                        n_pred = pmask_b[L0 + start : L0 + end].sum().item()
+                        mask_ratio_block = (n_pred / block_len) if block_len > 0 else 0.0
+                        t_val = 1.0 - mask_ratio_block
+                        t_b[L0 + start : L0 + end] = t_val
+                    mask_ratio_list.append(t_b)
+            mask_ratio = torch.stack(mask_ratio_list, dim=0)
 
         elif config.training.method == "TraceESPO":
             # 与 TraceRL 相同的多轮 step_map 生成，同时为每条样本构造 mask_ratio 供 ESPO loss 使用。
@@ -676,10 +719,23 @@ def main():
         return extended_input_ids, p_mask, tok_idx_ext, labels, reward_list, mask_ratio
         
 
-    extended_input_ids, p_mask, tok_idx_ext, labels, rewards, mask_ratio = collect_training_data(input_ids_lm, step_map_list, reward_list)
-
-
-    dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, rewards, mask_ratio)
+    method_handler = get_rl_sdar_method_handler(config.training.method)
+    build_ctx = RLBuildContext(
+        input_ids_lm=input_ids_lm,
+        step_map_list=step_map_list,
+        reward_list=reward_list,
+        config=config,
+        start_pos=start_pos,
+        post_num=post_num,
+        mask_id=mask_id,
+        pad_id=pad_id,
+        collect_training_data=collect_training_data,
+        # collapse_k_unique=collapse_k_unique,
+        # one_round_vectorized=one_round_vectorized,
+        # train_dataset_class=TrainDataset,
+        # simple_collate_fn=simple_collate,
+    )
+    dataset_lm, collate_fn_lm = method_handler.build(build_ctx)
 
     total_batch_size_lm = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
     num_update_steps_per_epoch = math.ceil(len(dataset_lm) / total_batch_size_lm)
@@ -698,8 +754,21 @@ def main():
         dataset_lm,
         batch_size=config.training.batch_size_lm,
         sampler=None,
-        collate_fn=simple_collate,
+        collate_fn=collate_fn_lm,
         num_workers=0
+    )
+
+    rl_sdar_train_step_ctx = RLTrainStepContext(
+        accelerator=accelerator,
+        dataset_lm=dataset_lm,
+        train_dataloader_lm=train_dataloader_lm,
+        model=model,
+        config=config,
+        basic_block_attention=basic_block_attention,
+        start_pos=start_pos,
+        response_length=L1,
+        pad_id=pad_id
+        # process_pad=process_pad
     )
 
 
@@ -712,78 +781,12 @@ def main():
     )
 
 
-    import torch.nn.functional as F
-
-    def get_elbo(response_ids, response_logits, mask_ratio, is_mask):
-        """
-        Return per-sample ELBO-like score with shape (B,).
-        We use the average log-probability on masked response tokens.
-        """
-        token_log_probs = F.log_softmax(response_logits, dim=-1).gather(
-            dim=-1, index=response_ids.unsqueeze(-1)
-        ).squeeze(-1)  # (B, L1)
-        weighted_token_log_probs = token_log_probs.masked_fill_(~is_mask, 0) / mask_ratio
-        return weighted_token_log_probs.sum(dim=1)
-        
-
-    @torch.no_grad()
-    def compute_logp_old_tok_parallel(
-            accelerator,
-            dataset,
-            train_dataloader_lm,
-            start_pos, pad_id,
-            batch_size):
-
-        model.eval()
-
-        dl = train_dataloader_lm
-
-        for batch in dl:
-            ids        = batch["ids"]         
-            extended_input_ids = batch["extended_input_ids"].to(accelerator.device)
-            p_mask = batch["p_mask"].to(accelerator.device)
-            tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
-            labels = batch["labels"].to(accelerator.device)
-            mask_ratio = batch["mask_ratio"].to(accelerator.device)
-
-            B, L = p_mask.shape
-            L0    = start_pos
-            L1    = L - L0
-            device = extended_input_ids.device
-
-            attention_mask = basic_block_attention.clone()
-            attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
-            attention_mask = process_pad(attention_mask, extended_input_ids)
-
-            logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
-            logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
-            if config.training.method in ("ESPO", "TraceESPO"):
-                elbo = get_elbo(labels[:, L0:], logits[:, L0:], mask_ratio[:,L0:], p_mask[:,L0:])
-                dataset.logp_old_seq[ids] = elbo.float().cpu()
-            else:
-                log_probs = F.log_softmax(logits, dim=-1)
-                logp_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    
-                dataset.logp_old_tok[ids] = logp_tok.float().cpu()
-
-        accelerator.wait_for_everyone()
-
-        model.train()
-
-
     #################################
     #             Inference         #
     #################################
     logger.info("***** Running inference *****")
 
-    compute_logp_old_tok_parallel(
-        accelerator,
-        dataset_lm,
-        train_dataloader_lm,
-        start_pos=start_pos,
-        pad_id=pad_id,
-        batch_size=config.training.batch_size_lm,
-    )
+    method_handler.compute_logp_old(rl_sdar_train_step_ctx)
 
 
     #################################
@@ -814,30 +817,79 @@ def main():
 
     
 
-    def kl_estimator(log_ratio, p_mask, estimator):
-        """Per-token KL divergence.  delta = logp_new - logp_old."""
-        log_ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio))
-        if estimator == "k1":
-            return log_ratio.clamp(-10.0, 10.0)
-        elif estimator == "k2":
-            return 0.5 * log_ratio.pow(2)
-        elif estimator == "k3":
-            return (-log_ratio).clamp(-10.0, 10.0).exp() - 1.0 + log_ratio
-        else:
-            raise ValueError(f"Unknown KL estimator: {estimator}")
+    def compute_importance_ratio(log_ratio, mask=None, normalize=None):
+        """
+        Compute numerically-stable importance ratio from log-ratio.
+        normalize:
+            - None: no normalization
+            - "sum_per_row": divide each row by row-wise sum
+            - "mean_all": divide by global mean
+        """
+        importance_ratio = torch.exp(log_ratio.clamp(-10.0, 10.0))
+        if mask is not None:
+            importance_ratio = torch.where(mask, importance_ratio, torch.zeros_like(importance_ratio))
 
-    kl_mode = config.training.get("kl_mode", None)
+        if normalize == "sum_per_row":
+            row_sum = importance_ratio.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            importance_ratio = importance_ratio / row_sum
+        elif normalize == "mean_all":
+            importance_ratio = importance_ratio / importance_ratio.mean().clamp(min=1e-8)
+        elif normalize is not None:
+            raise ValueError(f"Unknown importance-ratio normalization: {normalize}")
 
-    def kl_estimator(log_ratio_seq, estimator):
-        """Per-sequence KL divergence.  delta = logp_new - logp_old."""
-        if estimator == "k1":
-            return log_ratio_seq.clamp(-10.0, 10.0)
-        elif estimator == "k2":
-            return 0.5 * log_ratio_seq.pow(2)
-        elif estimator == "k3":
-            return (-log_ratio_seq).clamp(-10.0, 10.0).exp() - 1.0 + log_ratio_seq
+        return importance_ratio
+
+    def forward_process_basline(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
+
+        adv = torch.as_tensor(adv, device=extended_input_ids.device).detach()
+
+        B, L = p_mask.shape
+        L0    = start_pos
+        L1    = L - L0
+        device = extended_input_ids.device
+
+        attention_mask = basic_block_attention.clone()
+        attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
+        attention_mask = process_pad(attention_mask, extended_input_ids)
+
+        logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
+        logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
+
+        ratio   = logp_new_tok - logp_old_tok
+        ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        ratio   = torch.exp(ratio)          # (B, T)
+        clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
+
+        adv_tok = adv.unsqueeze(1)
+
+        surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
+        surrogate_tok = surrogate_tok * p_mask
+
+        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
+        surrogate_tok = surrogate_tok.sum(dim=1) / L1
+
+        policy_loss = - (surrogate_tok.sum() / B)
+
+        # KL penalty (optional)
+        kl_loss = torch.tensor(0.0, device=policy_loss.device)
+        if config.training.beta > 0:
+            kl_seq = logp_new_tok - logp_old_tok
+            kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
+            if config.training.use_kl_estimator_k3:
+                t = (-kl_seq).clamp(-10.0, 10.0)
+                kl_seq = t.exp() - 1.0 + kl_seq
+            kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
+            kl_loss = config.training.beta * kl_seq.sum() / B
+            total_loss = policy_loss + kl_loss
         else:
-            raise ValueError(f"Unknown KL estimator: {estimator}")
+            total_loss = policy_loss
+
+        return total_loss
+
         
     def forward_process_token(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok, mask_ratio):
 
@@ -876,20 +928,42 @@ def main():
         # kl_mean = torch.zeros((), device=policy_loss.device)
         kl_loss = torch.tensor(0.0, device=device)
         kl_mean = torch.zeros((), device=device)
+        kl_std = torch.zeros((), device=device)
         kl_estimator_type = config.training.get("kl_estimator", "k1")
         kl_mode = config.training.get("kl_mode", "in_loss")
+        use_kl_importance_weight = config.training.get("use_kl_importance_weight", False)
+        use_kl_clip = config.training.get("use_kl_clip", False)
+        use_kl_length_normalization = config.training.get("use_kl_length_normalization", False)
         if config.training.beta > 0:
-            kl_seq = logp_new_tok - logp_old_tok
-            kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
+            # kl_seq = logp_new_tok - logp_old_tok
+            # kl_seq = torch.where(p_mask, kl_seq, torch.zeros_like(kl_seq))
             # if config.training.get("use_kl_estimator_k3", True):
             #     t = (-kl_seq).clamp(-10.0, 10.0)
             #     kl_seq = t.exp() - 1.0 + kl_seq
             # elif config.training.use_kl_estimator_k2:
             #     kl_seq = 0.5 * kl_seq.pow(2)
-            kl_seq = kl_estimator(kl_seq, kl_estimator_type)
+            log_ratio = torch.where(p_mask, log_ratio, torch.zeros_like(log_ratio))
+            if kl_estimator_type == "rb":
+                kl_seq = kl_estimator(log_ratio, kl_estimator_type, log_ratio_old=logp_old_tok)
+            else:
+                kl_seq = kl_estimator(log_ratio, kl_estimator_type)
+            if use_kl_importance_weight and kl_estimator_type != "rb":
+                iw_tok = torch.exp(log_ratio)
+            else:
+                iw_tok = torch.ones_like(log_ratio)
 
-            kl_seq = (kl_seq * p_mask).sum(dim=1) / L1
+            if use_kl_clip:
+                clipped_iw_tok = torch.clamp(iw_tok, 1 - config.training.eps, 1 + config.training.eps)
+                kl_seq = torch.min(iw_tok * kl_seq, clipped_iw_tok * kl_seq)
+            else:
+                kl_seq = iw_tok * kl_seq
+
+            if use_kl_length_normalization:
+                kl_seq = kl_seq.sum(dim=1) / L1
+            else:
+                kl_seq = kl_seq.sum(dim=1)
             kl_mean = kl_seq.mean()
+            kl_std = kl_seq.std(unbiased=False) if kl_seq.numel() > 1 else torch.zeros((), device=kl_seq.device)
             kl_loss = config.training.beta * kl_seq.sum() / B
 
 
@@ -942,6 +1016,7 @@ def main():
             "policy/surr_abs_mean": surrogate_tok_abs_mean.detach(),
             "policy/surr_pos_frac": surrogate_tok_pos_frac.detach(),
             "kl/mean": kl_mean.detach(),
+            "kl/std": kl_std.detach(),
             "policy/entropy": entropy_mean.detach(),
             "log_ratio/tok_mean": log_ratio_tok_mean.detach(),
             "log_ratio/tok_std": log_ratio_tok_std.detach(),
@@ -994,10 +1069,12 @@ def main():
         beta = config.training.beta
         kl_per_seq = torch.zeros(B, device=device)
         kl_mean = torch.zeros((), device=device)
+        kl_std = torch.zeros((), device=device)
         kl_loss = torch.zeros(B, device=device)
         if beta > 0 and config.training.kl_estimator != "none":
             kl_per_seq = kl_estimator(log_ratio_seq, config.training.kl_estimator)
             kl_mean = kl_per_seq.mean()
+            kl_std = kl_per_seq.std(unbiased=False) if kl_per_seq.numel() > 1 else torch.zeros((), device=kl_per_seq.device)
 
         # --- PPO surrogate ---
         if kl_mode == "in_reward":
@@ -1056,6 +1133,7 @@ def main():
             "policy/surr_abs_mean": surrogate_abs_mean.detach(),
             "policy/surr_pos_frac": surrogate_pos_frac.detach(),
             "kl/mean": kl_mean.detach(),
+            "kl/std": kl_std.detach(),
             "policy/entropy": entropy_mean.detach(),
             "log_ratio/seq_mean": log_ratio_mean.detach(),
             "log_ratio/seq_std": log_ratio_std.detach(),
@@ -1072,8 +1150,6 @@ def main():
         }
 
         return total_loss, metrics
-
-
     def calculate_metrics(totals, counts):
         result = {}
         for name, total in totals.items():
@@ -1134,39 +1210,7 @@ def main():
 
             data_time_m.update(time.time() - end)
 
-            extended_input_ids = batch["extended_input_ids"].to(accelerator.device)
-            p_mask = batch["p_mask"].to(accelerator.device)
-            tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
-            labels = batch["labels"].to(accelerator.device)
-            reward = batch["reward"]
-            mask_ratio = batch["mask_ratio"].to(accelerator.device)
-            if config.training.method in ("ESPO", "TraceESPO"):
-                old_lp = dataset_lm.logp_old_seq[batch["ids"].cpu()].to(accelerator.device)
-            else:
-                old_lp = dataset_lm.logp_old_tok[batch["ids"].cpu()].to(accelerator.device)
-
-            if torch.isneginf(old_lp).any().item():
-                print(old_lp)
-
-            if config.training.method in ("ESPO", "TraceESPO"):
-                loss_lm, step_metrics = forward_process_espo(
-                    extended_input_ids=extended_input_ids,
-                    p_mask=p_mask,
-                    tok_idx_ext=tok_idx_ext,
-                    labels=labels,
-                    adv=reward,
-                    logp_old_seq=old_lp,
-                    mask_ratio=mask_ratio)
-            else:
-                loss_lm, step_metrics = forward_process_token(
-                    extended_input_ids=extended_input_ids,
-                    p_mask=p_mask,
-                    tok_idx_ext=tok_idx_ext,
-                    labels=labels,
-                    adv=reward,
-                    logp_old_tok=old_lp,
-                    mask_ratio=mask_ratio
-                )
+            loss_lm, step_metrics = method_handler.train_step(rl_sdar_train_step_ctx, batch)
             loss_lm = loss_lm / accelerator.gradient_accumulation_steps
 
             if accelerator.is_local_main_process and step <= 5:
