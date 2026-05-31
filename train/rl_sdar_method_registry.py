@@ -727,33 +727,7 @@ class DefaultMethodHandler(ABC):
         if torch.isneginf(old_lp).any().item():
             print(old_lp)
         return self.forward_process(fwd_ctx, batch, old_lp)
-        # if self.logp_old_is_seq:
-        #     old_lp = tctx.dataset_lm.logp_old_seq[batch["ids"].cpu()].to(device)
-        #     if torch.isneginf(old_lp).any().item():
-        #         print(old_lp)
-        #     return _forward_process_espo(
-        #         tctx,
-        #         extended_input_ids=extended_input_ids,
-        #         p_mask=p_mask,
-        #         tok_idx_ext=tok_idx_ext,
-        #         labels=labels,
-        #         adv=reward,
-        #         logp_old_seq=old_lp,
-        #         mask_ratio=mask_ratio,
-        #     )
-        # old_lp = tctx.dataset_lm.logp_old_tok[batch["ids"].cpu()].to(device)
-        # if torch.isneginf(old_lp).any().item():
-        #     print(old_lp)
-        # return _forward_process_token(
-        #     tctx,
-        #     extended_input_ids=extended_input_ids,
-        #     p_mask=p_mask,
-        #     tok_idx_ext=tok_idx_ext,
-        #     labels=labels,
-        #     adv=reward,
-        #     logp_old_tok=old_lp,
-        #     mask_ratio=mask_ratio,
-        # )
+    
 
     def forward_process(self, tctx: RLTrainStepContext, batch: Dict[str, Any], old_lp: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
         config = tctx.config
@@ -807,8 +781,46 @@ class DefaultMethodHandler(ABC):
             total_loss = policy_loss + kl_loss
         else:
             total_loss = policy_loss
+        metrics = TrainStepMetrics(
+            tot_loss=total_loss.detach(),
+            policy_loss=policy_loss.detach(),
+            kl_loss=kl_loss.detach(),
+            kl_mean=kl_seq.mean().detach(),
+            kl_std=kl_seq.std(unbiased=False).detach(),
+            log_ratio_mean=log_ratio_mean,
+            log_ratio_std=log_ratio_std,
+        )
+        return total_loss, self.metric_to_dict(metrics) 
 
-        return total_loss
+    def metric_to_dict(self, metrics: TrainStepMetrics) -> Dict[str, float]:
+        return {
+            "loss/total": metrics.tot_loss.item(),
+            "loss/policy": metrics.policy_loss.item(),
+            "loss/kl": metrics.kl_loss.item(),
+            "kl/mean": metrics.kl_mean.item(),
+            "kl/std": metrics.kl_std.item(),
+            "log_ratio/seq_mean": metrics.log_ratio_mean.item(),
+            "log_ratio/seq_std": metrics.log_ratio_std.item(),
+            "log_ratio/seq_abs_mean": metrics.log_ratio_abs_mean.item(),
+            "log_ratio/per_tok_mean": metrics.log_ratio_per_tok_mean.item(),
+            "adv_eff/mean": metrics.adv_effective_mean.item(),
+            "adv_eff/std": metrics.adv_effective_std.item(),
+            "adv/mean": metrics.reward_mean.item(),
+            "adv/std": metrics.reward_std.item(),
+            "clip_count": metrics.clip_count.item(),
+            "clip_total": metrics.clip_total.item(),
+            "elbo/mean": metrics.elbo_mean.item(),
+            "elbo/std": metrics.elbo_std.item(),
+            "policy/entropy": metrics.entropy_mean.item(),
+            "policy/surr_abs_mean": metrics.surrogate_abs_mean.item(),
+            "policy/surr_pos_frac": metrics.surrogate_pos_frac.item(),
+            "adv_eff/mean": metrics.adv_effective_mean.item(),
+            "adv_eff/std": metrics.adv_effective_std.item(),
+            "adv/mean": metrics.reward_mean.item(),
+            "adv/std": metrics.reward_std.item(),
+            "clip_count": metrics.clip_count.item(),
+            "clip_total": metrics.clip_total.item(),
+        }
 
 
 class ESPOForwardHandler(DefaultMethodHandler):
@@ -818,6 +830,7 @@ class ESPOForwardHandler(DefaultMethodHandler):
     def logp_old_is_seq(self) -> bool:
         return True
 
+        
 
 class DUELHandler(DefaultMethodHandler):
     """DUEL + theory mask_ratio; dataset lives in rl_sdar_duel_theory."""
@@ -898,6 +911,56 @@ class DUELHandler(DefaultMethodHandler):
             valid=valid,
         )
         return dataset, DUELTrainDataset.collate
+
+    def logp(self, ctx: ForwardProcessContext, model) -> Tensor:
+        
+
+    def compute_logp_old(self, tctx: RLTrainStepContext) -> None:
+        accelerator = tctx.accelerator
+        dataset = tctx.dataset_lm
+        train_dataloader_lm = tctx.train_dataloader_lm
+        model = tctx.model
+        L0 = tctx.start_pos
+        L1 = tctx.response_length
+        basic_block_attention = tctx.basic_block_attention
+        process_pad = partial(process_pad_fn, start_pos=L0, pad_id=tctx.pad_id, L0=L0, L1=L1)
+        # get_elbo = tctx.get_elbo
+
+        model.eval()
+        for batch in train_dataloader_lm:
+            ids = batch["ids"]
+            extended_input_ids = batch["extended_input_ids"].to(accelerator.device)
+            p_mask = batch["p_mask"].to(accelerator.device)
+            tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
+            labels = batch["labels"].to(accelerator.device)
+
+            B = p_mask.shape[0]
+            device = extended_input_ids.device
+
+            attention_mask = basic_block_attention.clone()
+            attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
+            attention_mask = process_pad(attention_mask, extended_input_ids)
+
+            fwd_ctx = ForwardProcessContext(extended_input_ids=extended_input_ids, 
+            p_mask=p_mask, tok_idx_ext=tok_idx_ext, labels=labels, 
+            adv=None, logp_old=None, attention_mask=attention_mask, L0=L0, L1=L1)
+
+            # logits = model(input_ids=extended_input_ids, attention_mask=attention_mask, position_ids=tok_idx_ext).logits
+            # logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)
+            if self.logp_old_is_seq:
+                # elbo = get_elbo(labels[:, L0:], logits[:, L0:], mask_ratio[:, L0:], p_mask[:, L0:])
+                # dataset.logp_old[ids] = elbo.float().cpu()
+                raise NotImplementedError("Sequence-level logp_old is not implemented for DUEL")
+            else:
+                # log_probs = F.log_softmax(logits, dim=-1)
+                # logp_tok = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+                # dataset.logp_old_tok[ids] = logp_tok.float().cpu()
+                logp_tok = self.logp(fwd_ctx, model)
+                dataset.logp_old[ids] = logp_tok.float().cpu()
+        accelerator.wait_for_everyone()
+        model.train()
+
+
 
 _METHOD_REGISTRY: Dict[str, RLSDARMethodHandler] = {}
 
